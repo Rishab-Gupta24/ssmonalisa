@@ -952,7 +952,7 @@ int main() {
     for (auto& n : lkNames) files.push_back(open_in(n)), kindOf.push_back(2);
     size_t totalBytes = 0;
     for (auto& f : files) totalBytes += f.n;
-    ARENA.init(totalBytes * 3 + ((size_t)1 << 30));
+    ARENA.init(totalBytes * 2 + ((size_t)1 << 30));
 
     // ---- products / categories
     std::vector<std::string> cats;
