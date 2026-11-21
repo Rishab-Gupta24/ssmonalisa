@@ -2,6 +2,7 @@
 // Reads $DATA_DIR, writes $OUTPUT_DIR/user_daily and $OUTPUT_DIR/campaign_daily as Parquet.
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,7 +15,9 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <immintrin.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -33,7 +36,20 @@ static int NT = 8;
 
 static void die(const char* m) {
     fprintf(stderr, "fatal: %s\n", m);
-    exit(1);
+    _exit(1);
+}
+
+static double T0 = 0;
+static bool TIMING = false;
+static double now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void mark(const char* what) {
+    if (!TIMING) return;
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+    fprintf(stderr, "%8.1f ms  cpu %7.1f ms  %s\n", (now_s() - T0) * 1000, cpu * 1000, what);
 }
 
 // ---------------------------------------------------------------- threads
@@ -45,28 +61,78 @@ static void parallel(int n, F f) {
     for (auto& x : th) x.join();
 }
 
-// ---------------------------------------------------------------- files
-struct MFile {
-    const char* p = nullptr;
-    size_t n = 0;
-};
+// dynamic task loop: f(t, task)
+template <class F>
+static void run_tasks(size_t ntasks, F f) {
+    std::atomic<size_t> next{0};
+    parallel(NT, [&](int t) {
+        size_t i;
+        while ((i = next.fetch_add(1, std::memory_order_relaxed)) < ntasks) f(t, i);
+    });
+}
 
-static MFile map_file(const std::string& path) {
-    MFile m;
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) return m;
-    struct stat st;
-    if (fstat(fd, &st) == 0 && st.st_size > 0) {
-        void* p = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (p != MAP_FAILED) {
-            m.p = (const char*)p;
-            m.n = st.st_size;
-            madvise(p, st.st_size, MADV_WILLNEED);
+// ---------------------------------------------------------------- arena + block lists
+struct Arena {
+    char* base = nullptr;
+    size_t cap = 0;
+    std::atomic<size_t> off{0};
+    void init(size_t c) {
+        cap = c;
+        void* p = mmap(nullptr, c, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p == MAP_FAILED) die("arena mmap");
+        base = (char*)p;
+        madvise(base, c, MADV_HUGEPAGE);
+    }
+    void* get(size_t n) {
+        n = (n + 63) & ~(size_t)63;
+        size_t o = off.fetch_add(n, std::memory_order_relaxed);
+        if (o + n > cap) die("arena exhausted");
+        return base + o;
+    }
+};
+static Arena ARENA;
+
+template <class T>
+struct BList {
+    struct Blk {
+        Blk* next;
+        u32 n, cap;
+        T* items() { return (T*)(this + 1); }
+    };
+    Blk* head = nullptr;
+    Blk* cur = nullptr;
+    size_t done = 0;  // items in full blocks before cur
+    inline void push(const T& v, u32 bcap) {
+        if (__builtin_expect(!cur || cur->n == cur->cap, 0)) grow(bcap);
+        cur->items()[cur->n++] = v;
+    }
+    void grow(u32 bcap) {
+        Blk* b = (Blk*)ARENA.get(sizeof(Blk) + (size_t)bcap * sizeof(T));
+        b->next = nullptr;
+        b->n = 0;
+        b->cap = bcap;
+        if (cur) {
+            done += cur->n;
+            cur->next = b;
+        } else
+            head = b;
+        cur = b;
+    }
+    size_t size() const { return done + (cur ? cur->n : 0); }
+    template <class F>
+    void each(F f) const {
+        for (Blk* b = head; b; b = b->next) {
+            T* it = b->items();
+            for (u32 i = 0; i < b->n; i++) f(it[i]);
         }
     }
-    close(fd);
-    return m;
-}
+};
+
+// ---------------------------------------------------------------- files
+struct InFile {
+    int fd = -1;
+    size_t n = 0;
+};
 
 static std::vector<std::string> list_csv(const std::string& dir) {
     std::vector<std::string> out;
@@ -86,10 +152,30 @@ static std::vector<std::string> list_csv(const std::string& dir) {
     return out;
 }
 
+static InFile open_in(const std::string& path) {
+    InFile f;
+    f.fd = open(path.c_str(), O_RDONLY);
+    if (f.fd < 0) return f;
+    struct stat st;
+    if (fstat(f.fd, &st) == 0) f.n = st.st_size;
+    return f;
+}
+
+static void pread_all(int fd, char* dst, size_t n, size_t off) {
+    while (n) {
+        ssize_t r = pread(fd, dst, n, off);
+        if (r <= 0) die("read failed");
+        dst += r;
+        n -= r;
+        off += r;
+    }
+}
+
 static std::string read_small(const std::string& path) {
-    MFile m = map_file(path);
-    std::string s(m.p ? m.p : "", m.n);
-    if (m.p) munmap((void*)m.p, m.n);
+    InFile f = open_in(path);
+    std::string s(f.n, '\0');
+    if (f.n) pread_all(f.fd, s.data(), f.n, 0);
+    if (f.fd >= 0) close(f.fd);
     return s;
 }
 
@@ -138,9 +224,9 @@ static inline i64 parse_ts(const char* s, size_t n) {
         return ((days * 24 + h) * 60 + mi) * 60000 + se * SEC - off;
     }
     // F3: digits only
-    size_t i = 0;
     for (size_t k = 0; k < n; k++)
         if (!dig(s[k])) return TS_BAD;
+    size_t i = 0;
     while (i < n && s[i] == '0') i++;
     if (n - i > 18) return TS_BAD;  // far outside any window
     i64 v = 0;
@@ -162,6 +248,15 @@ static void init_ch() {
 }
 static const char DECH[] = "?0123456789_abcdefghijklmnopqrstuvwxyz";
 
+static inline u64 mix64(u64 k) {
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33;
+    return k;
+}
+
 static inline u64 hash_bytes(const char* s, size_t n) {
     u64 h = 0x9E3779B97F4A7C15ULL ^ (n * 0xff51afd7ed558ccdULL);
     for (size_t i = 0; i < n; i++) {
@@ -169,10 +264,7 @@ static inline u64 hash_bytes(const char* s, size_t n) {
         h *= 0x100000001b3ULL;
         h ^= h >> 29;
     }
-    h ^= h >> 33;
-    h *= 0xc4ceb9fe1a85ec53ULL;
-    h ^= h >> 33;
-    return h;
+    return mix64(h);
 }
 
 static inline u64 enc_key(const char* s, size_t n, bool& canon) {
@@ -197,19 +289,23 @@ static inline u64 enc_key(const char* s, size_t n, bool& canon) {
 
 static std::unordered_map<u64, std::string_view> REG;  // noncanonical key -> string
 
-static std::string key_str(u64 k) {
+static void key_append(u64 k, std::string& out) {
     if (k & NONCANON) {
         auto it = REG.find(k);
         if (it == REG.end()) die("unregistered key");
-        return std::string(it->second);
+        out.append(it->second.data(), it->second.size());
+        return;
     }
-    std::string s;
-    s.push_back((char)('a' + ((k >> 48) & 31) - 1));
+    out.push_back((char)('a' + ((k >> 48) & 31) - 1));
     for (int sh = 42; sh >= 0; sh -= 6) {
         int c = (k >> sh) & 63;
         if (!c) break;
-        s.push_back(DECH[c]);
+        out.push_back(DECH[c]);
     }
+}
+static std::string key_str(u64 k) {
+    std::string s;
+    key_append(k, s);
     return s;
 }
 
@@ -225,18 +321,19 @@ struct HMap {
     std::vector<u64> k, v;
     u64 mask = 0;
     int shift = 64;
-    size_t count = 0;
     void init(size_t n) {
         size_t cap = 16;
         while (cap < n * 2) cap <<= 1;
-        k.assign(cap, 0);
-        v.assign(cap, 0);
+        if (k.size() == cap) {
+            std::fill(k.begin(), k.end(), 0);
+        } else {
+            k.assign(cap, 0);
+            v.assign(cap, 0);
+        }
         mask = cap - 1;
         shift = 64 - __builtin_ctzll(cap);
-        count = 0;
     }
     inline size_t slot(u64 key) const { return (size_t)((key * 0x9E3779B97F4A7C15ULL) >> shift); }
-    // returns pointer to value, inserting (with value def) if absent; sets inserted
     inline u64* upsert(u64 key, u64 def, bool& inserted) {
         size_t i = slot(key);
         while (true) {
@@ -248,7 +345,6 @@ struct HMap {
                 k[i] = key;
                 v[i] = def;
                 inserted = true;
-                count++;
                 return &v[i];
             }
             i = (i + 1) & mask;
@@ -265,10 +361,141 @@ struct HMap {
     }
 };
 
-// ---------------------------------------------------------------- CSV
-// Splits [b,e) into exactly NF fields per rules.md; returns false if malformed.
+// ---------------------------------------------------------------- region-partitioned table (links)
+// 256 regions, each a contiguous run of slots; probing wraps inside the region, so regions
+// can be filled in parallel. Region of a key = top 8 bits of mix64(key).
+struct Slot {
+    u64 k, v;
+};
+struct RTable {
+    Slot* s = nullptr;
+    int bits = 16;
+    size_t rmask = 0;
+    void init(size_t n) {
+        bits = 16;
+        while (((size_t)1 << bits) < n) bits++;
+        size_t size = (size_t)1 << bits;
+        s = (Slot*)ARENA.get(size * sizeof(Slot));  // arena memory is fresh, hence zero
+        rmask = (size >> 8) - 1;
+    }
+    inline size_t start(u64 key) const { return (size_t)(mix64(key) >> (64 - bits)); }
+    inline size_t next(size_t i) const { return (i & ~rmask) | ((i + 1) & rmask); }
+    inline const Slot* find(u64 key) const {
+        size_t i = start(key);
+        while (true) {
+            if (s[i].k == key) return &s[i];
+            if (!s[i].k) return nullptr;
+            i = next(i);
+        }
+    }
+    inline void prefetch(u64 key) const { __builtin_prefetch(&s[start(key)]); }
+};
+static inline int region_of(u64 key) { return (int)(mix64(key) >> 56); }
+
+// ---------------------------------------------------------------- CSV line scanning
+// Buffers always have >= 64 readable bytes past their logical end.
+struct Line {
+    const char* p;
+    u32 len;
+    u32 nc;          // number of commas
+    u32 commas[16];  // comma offsets (first min(nc,16))
+    u32 qw[8];       // quote bit mask words (lines up to 256 bytes)
+    u32 anyq;
+};
+
+// Scans one line starting at p (ends at '\n' or lim). Returns false if longer than 256 bytes
+// (then only len is valid).
+static inline bool scan_line(const char* p, const char* lim, Line& L) {
+    const __m256i NL = _mm256_set1_epi8('\n'), CM = _mm256_set1_epi8(','), QT = _mm256_set1_epi8('"');
+    L.p = p;
+    L.nc = 0;
+    L.anyq = 0;
+    u32 off = 0;
+    while (true) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)(p + off));
+        u32 nl = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, NL));
+        u32 cm = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, CM));
+        u32 q = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, QT));
+        if (p + off + 32 > lim) {
+            u32 rem = (u32)(lim - (p + off));
+            u32 m = rem >= 32 ? 0xFFFFFFFFu : ((1u << rem) - 1);
+            nl = (nl & m) | (rem < 32 ? (1u << rem) : 0);
+        }
+        u32 keep = 0xFFFFFFFFu;
+        if (nl) {
+            u32 k = __builtin_ctz(nl);
+            keep = k == 32 ? 0xFFFFFFFFu : ((1u << k) - 1);
+            cm &= keep;
+            q &= keep;
+            if (off < 256) {
+                L.qw[off >> 5] = q;
+                L.anyq |= q;
+                while (cm) {
+                    if (L.nc < 16) L.commas[L.nc] = off + __builtin_ctz(cm);
+                    L.nc++;
+                    cm &= cm - 1;
+                }
+            }
+            L.len = off + k;
+            return L.len <= 256 && off < 256;
+        }
+        if (off < 256) {
+            L.qw[off >> 5] = q;
+            L.anyq |= q;
+            while (cm) {
+                if (L.nc < 16) L.commas[L.nc] = off + __builtin_ctz(cm);
+                L.nc++;
+                cm &= cm - 1;
+            }
+        }
+        off += 32;
+        if (off >= 4096) {
+            // very long line: find its end with memchr
+            const char* nlp = (const char*)memchr(p + off, '\n', lim - (p + off));
+            L.len = (u32)((nlp ? nlp : lim) - p);
+            return false;
+        }
+    }
+}
+
+static inline bool qbit(const Line& L, u32 x) { return (L.qw[x >> 5] >> (x & 31)) & 1; }
+
+// Field extraction per rules.md from a scanned line. Returns false if malformed.
 template <int NF>
-static inline bool split(const char* b, const char* e, const char** fp, u32* fl) {
+static inline bool fields(const Line& L, const char** fp, u32* fl) {
+    if (L.nc != NF - 1) return false;
+    u32 s = 0;
+    if (!L.anyq) {
+        for (int k = 0; k < NF; k++) {
+            u32 e = k < NF - 1 ? L.commas[k] : L.len;
+            fp[k] = L.p + s;
+            fl[k] = e - s;
+            s = e + 1;
+        }
+        return true;
+    }
+    u32 total = 0;
+    for (int w = 0; w < 8 && (u32)w * 32 < L.len + 1; w++) total += __builtin_popcount(L.qw[w]);
+    u32 expect = 0;
+    for (int k = 0; k < NF; k++) {
+        u32 e = k < NF - 1 ? L.commas[k] : L.len;
+        if (e > s && qbit(L, s)) {
+            if (e - s < 2 || !qbit(L, e - 1)) return false;
+            expect += 2;
+            fp[k] = L.p + s + 1;
+            fl[k] = e - s - 2;
+        } else {
+            fp[k] = L.p + s;
+            fl[k] = e - s;
+        }
+        s = e + 1;
+    }
+    return total == expect;
+}
+
+// Slow path for lines longer than 256 bytes.
+template <int NF>
+static inline bool split_slow(const char* b, const char* e, const char** fp, u32* fl) {
     int k = 0;
     const char* fs = b;
     for (const char* p = b;; ++p) {
@@ -293,44 +520,68 @@ static inline bool split(const char* b, const char* e, const char** fp, u32* fl)
     return k == NF;
 }
 
-struct Chunk {
-    int file;
-    size_t s, e;  // nominal byte range
-    int kind;     // 0 events, 1 clicks, 2 links
-};
-
-static void make_chunks(const std::vector<MFile>& files, int kind, size_t target, std::vector<Chunk>& out,
-                        int file_base) {
-    for (size_t f = 0; f < files.size(); f++) {
-        size_t n = files[f].n;
-        if (!n) continue;
-        for (size_t s = 0; s < n; s += target) out.push_back({(int)(file_base + f), s, std::min(n, s + target), kind});
+template <int NF, class F>
+static inline void for_rows(const char* b, const char* lim, F fn) {
+    Line L;
+    const char* fp[NF];
+    u32 fl[NF];
+    const char* p = b;
+    while (p < lim) {
+        bool fast = scan_line(p, lim, L);
+        bool ok = fast ? fields<NF>(L, fp, fl) : split_slow<NF>(p, p + L.len, fp, fl);
+        if (ok) fn(fp, fl);
+        p += L.len + 1;
     }
 }
 
-// Calls fn(line_begin, line_end) for each line whose first byte lies in [c.s, c.e), skipping the header.
-template <class F>
-static inline void for_lines(const MFile& m, size_t s, size_t e, F fn) {
-    const char* base = m.p;
-    const char* end = base + m.n;
-    const char* p;
-    if (s == 0) {
-        // skip header line
-        const char* nl = (const char*)memchr(base, '\n', m.n);
-        if (!nl) return;
-        p = nl + 1;
-    } else {
-        const char* nl = (const char*)memchr(base + s - 1, '\n', m.n - (s - 1));
-        if (!nl) return;
-        p = nl + 1;
-    }
-    const char* lim = base + e;
-    while (p < lim) {
-        const char* nl = (const char*)memchr(p, '\n', end - p);
-        const char* le = nl ? nl : end;
-        fn(p, le);
-        if (!nl) break;
-        p = nl + 1;
+// small clean files (products, campaigns)
+template <int NF, class F>
+static void for_rows_text(const std::string& t, F fn) {
+    std::string buf = t;
+    buf.append(64, '\0');
+    const char* b = buf.data();
+    const char* lim = b + t.size();
+    const char* nl = (const char*)memchr(b, '\n', t.size());
+    if (!nl) return;
+    for_rows<NF>(nl + 1, lim, fn);
+}
+
+struct Chunk {
+    int file;
+    int kind;  // 0 events, 1 clicks, 2 links
+    size_t s, e;
+};
+
+// Loads the lines of file f whose first byte lies in [s,e) into buf; sets [lb, le).
+static bool load_chunk(const InFile& f, size_t s, size_t e, std::vector<char>& buf, const char*& lb,
+                       const char*& le) {
+    const size_t EXTRA = 1 << 16;
+    size_t rs = s == 0 ? 0 : s - 1;
+    size_t re = std::min(f.n, e + EXTRA);
+    while (true) {
+        size_t need = re - rs + 64;
+        if (buf.size() < need) buf.resize(need + (need >> 3));
+        pread_all(f.fd, buf.data(), re - rs, rs);
+        memset(buf.data() + (re - rs), 0, 64);
+        const char* b = buf.data();
+        const char* nl0 = (const char*)memchr(b, '\n', re - rs);
+        if (!nl0) {
+            if (re == f.n) return false;
+            re = std::min(f.n, re + (re - rs));
+            continue;
+        }
+        const char* start = nl0 + 1;  // s==0: skip header; else first line starting at >= s
+        if ((size_t)(start - b) + rs >= e) return false;
+        // last owned line ends at the first '\n' at file position >= e-1
+        size_t from = (e - 1) - rs;
+        const char* endnl = (const char*)memchr(b + from, '\n', (re - rs) - from);
+        if (!endnl && re < f.n) {
+            re = std::min(f.n, re + std::max(EXTRA, re - rs));
+            continue;
+        }
+        lb = start;
+        le = endnl ? endnl : b + (re - rs);
+        return true;
     }
 }
 
@@ -343,6 +594,12 @@ struct ER {  // event row as parsed (for dedup)
     u32 packed;  // purchase: price | cat << 24 ; else 0
     u32 pad;
 };
+struct CK {  // valid click, before person resolution
+    u64 ukey;
+    u64 cid;
+    u32 ts;
+    u32 camp;
+};
 struct EV {  // surviving event
     u64 pkey;
     u32 ts;
@@ -354,11 +611,13 @@ struct CR {  // valid click
     u32 ts;
     u32 camp;
 };
-struct URow {
-    u64 pkey;
-    i32 day;
-    i32 topcat;  // -1 = null
-    u64 sessions, events, revenue;
+struct PK {
+    u64 a, b;
+};
+struct C2 {
+    u32 ts;
+    u32 camp;
+    u64 cid;
 };
 
 // ---------------------------------------------------------------- parquet writer
@@ -402,7 +661,7 @@ struct TW {
         st.push_back(last);
         last = 0;
     }
-    void ebeg() {  // struct as list element
+    void ebeg() {
         st.push_back(last);
         last = 0;
     }
@@ -425,12 +684,11 @@ struct TW {
 enum PType { P_INT32 = 1, P_INT64 = 2, P_BYTES = 6 };
 struct PCol {
     std::string name;
-    int type;
-    bool optional;
-    int logical;  // 0 none, 1 string, 6 date
-    std::string data;   // plain-encoded non-null values
+    int type = 0;
+    bool optional = false;
+    int logical = 0;      // 0 none, 1 string, 6 date
+    std::string data;     // plain-encoded non-null values
     std::vector<u8> def;  // definition levels (optional only)
-    size_t nvals = 0;
 };
 
 static void put_u32(std::string& s, u32 v) { s.append((const char*)&v, 4); }
@@ -452,19 +710,34 @@ static std::string rle_levels(const std::vector<u8>& d) {
 }
 
 static void write_parquet(const std::string& path, std::vector<PCol>& cols, size_t nrows) {
-    std::string f = "PAR1";
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) die("cannot write parquet");
+    std::string head = "PAR1";
+    i64 pos = 0;
     struct Meta {
         i64 off, size;
     };
     std::vector<Meta> metas;
+    std::vector<std::string> parts;  // header/levels pieces, written in order with data
+    auto wr = [&](const char* p, size_t n) {
+        while (n) {
+            ssize_t r = write(fd, p, n);
+            if (r <= 0) die("write failed");
+            p += r;
+            n -= r;
+        }
+        pos += 0;
+    };
+    wr(head.data(), 4);
+    pos = 4;
     for (auto& c : cols) {
-        std::string page;
-        if (c.optional) page += rle_levels(c.def);
-        page += c.data;
+        std::string lv;
+        if (c.optional) lv = rle_levels(c.def);
+        size_t psize = lv.size() + c.data.size();
         TW ph;
         ph.i32f(1, 0);
-        ph.i32f(2, (i64)page.size());
-        ph.i32f(3, (i64)page.size());
+        ph.i32f(2, (i64)psize);
+        ph.i32f(3, (i64)psize);
         ph.sbeg(5);
         ph.i32f(1, (i64)nrows);
         ph.i32f(2, 0);
@@ -472,10 +745,12 @@ static void write_parquet(const std::string& path, std::vector<PCol>& cols, size
         ph.i32f(4, 3);
         ph.send();
         ph.b.push_back(0);
-        i64 off = f.size();
-        f += ph.b;
-        f += page;
-        metas.push_back({off, (i64)(ph.b.size() + page.size())});
+        i64 off = pos;
+        wr(ph.b.data(), ph.b.size());
+        if (!lv.empty()) wr(lv.data(), lv.size());
+        wr(c.data.data(), c.data.size());
+        pos += ph.b.size() + psize;
+        metas.push_back({off, (i64)(ph.b.size() + psize)});
     }
     TW m;
     m.i32f(1, 1);
@@ -530,31 +805,75 @@ static void write_parquet(const std::string& path, std::vector<PCol>& cols, size
     m.send();
     m.binf(6, "ssmonalisa");
     m.b.push_back(0);
-    f += m.b;
-    put_u32(f, (u32)m.b.size());
-    f += "PAR1";
-    FILE* fp = fopen(path.c_str(), "wb");
-    if (!fp) die("cannot write parquet");
-    fwrite(f.data(), 1, f.size(), fp);
-    fclose(fp);
+    put_u32(m.b, (u32)(m.b.size()));
+    m.b += "PAR1";
+    // footer length must exclude the 4-byte length and magic: fix up
+    {
+        u32 flen = (u32)(m.b.size() - 8);
+        memcpy(&m.b[m.b.size() - 8], &flen, 4);
+    }
+    wr(m.b.data(), m.b.size());
+    close(fd);
 }
 
-static void col_i64(PCol& c, i64 v) {
-    c.data.append((const char*)&v, 8);
-    c.nvals++;
-}
-static void col_i32(PCol& c, i32 v) {
-    c.data.append((const char*)&v, 4);
-    c.nvals++;
-}
-static void col_str(PCol& c, const std::string& s) {
+static inline void col_i64(PCol& c, i64 v) { c.data.append((const char*)&v, 8); }
+static inline void col_i32(PCol& c, i32 v) { c.data.append((const char*)&v, 4); }
+static inline void col_str(PCol& c, const std::string& s) {
     put_u32(c.data, (u32)s.size());
     c.data += s;
-    c.nvals++;
+}
+static inline void col_key(PCol& c, u64 k) {
+    size_t at = c.data.size();
+    c.data.append(4, '\0');
+    key_append(k, c.data);
+    u32 n = (u32)(c.data.size() - at - 4);
+    memcpy(&c.data[at], &n, 4);
+}
+
+// ---------------------------------------------------------------- sorting helpers
+static void radix_sort_hi32(u64* a, size_t n, std::vector<u64>& tmp) {
+    // sorts by the high 32 bits (3 passes of 11 bits)
+    tmp.resize(n);
+    u64* src = a;
+    u64* dst = tmp.data();
+    for (int pass = 0; pass < 3; pass++) {
+        int sh = 32 + pass * 11;
+        size_t cnt[2048] = {0};
+        for (size_t i = 0; i < n; i++) cnt[(src[i] >> sh) & 2047]++;
+        size_t sum = 0;
+        for (int b = 0; b < 2048; b++) {
+            size_t c = cnt[b];
+            cnt[b] = sum;
+            sum += c;
+        }
+        for (size_t i = 0; i < n; i++) dst[cnt[(src[i] >> sh) & 2047]++] = src[i];
+        std::swap(src, dst);
+    }
+    if (src != a) memcpy(a, src, n * sizeof(u64));
+}
+
+static inline void sort_events(u64* a, size_t n, std::vector<u64>& tmp) {
+    if (n <= 24) {
+        for (size_t i = 1; i < n; i++) {
+            u64 x = a[i];
+            size_t j = i;
+            while (j > 0 && (a[j - 1] >> 32) > (x >> 32)) {
+                a[j] = a[j - 1];
+                j--;
+            }
+            a[j] = x;
+        }
+    } else if (n < 20000) {
+        std::sort(a, a + n, [](u64 x, u64 y) { return (x >> 32) < (y >> 32); });
+    } else {
+        radix_sort_hi32(a, n, tmp);
+    }
 }
 
 // ---------------------------------------------------------------- main
 int main() {
+    T0 = now_s();
+    TIMING = getenv("SS_TIMING") != nullptr;
     init_ch();
     const char* ev;
     std::string DATA = (ev = getenv("DATA_DIR")) ? ev : "/data";
@@ -585,32 +904,47 @@ int main() {
     const i64 DAY0 = floordiv(WS, DAYMS);
     const int NDAYS = (int)(floordiv(WE - 1, DAYMS) - DAY0 + 1);
 
+    // ---- input files
+    auto evNames = list_csv(DATA + "/events");
+    auto ckNames = list_csv(DATA + "/clicks");
+    auto lkNames = list_csv(DATA + "/links");
+    std::vector<InFile> files;
+    std::vector<int> kindOf;
+    for (auto& n : evNames) files.push_back(open_in(n)), kindOf.push_back(0);
+    for (auto& n : ckNames) files.push_back(open_in(n)), kindOf.push_back(1);
+    for (auto& n : lkNames) files.push_back(open_in(n)), kindOf.push_back(2);
+    size_t totalBytes = 0;
+    for (auto& f : files) totalBytes += f.n;
+    ARENA.init(totalBytes * 3 + ((size_t)1 << 30));
+
     // ---- products / categories
     std::vector<std::string> cats;
     HMap prodMap;
-    std::string prodText = read_small(DATA + "/products.csv");
     {
-        std::unordered_map<std::string, int> catIdx;
-        prodMap.init(1 << 16);
-        MFile m{prodText.data(), prodText.size()};
-        for_lines(m, 0, m.n, [&](const char* b, const char* e) {
-            const char* fp[2];
-            u32 fl[2];
-            if (!split<2>(b, e, fp, fl) || !fl[0]) return;
-            std::string c(fp[1], fl[1]);
-            auto it = catIdx.find(c);
-            int ci;
-            if (it == catIdx.end()) {
-                ci = (int)cats.size();
-                catIdx[c] = ci;
-                cats.push_back(c);
-            } else
-                ci = it->second;
-            bool cn;
-            u64 k = enc_key(fp[0], fl[0], cn);
-            bool ins;
-            *prodMap.upsert(k, 0, ins) = ci;
-        });
+        std::string prodText = read_small(DATA + "/products.csv");
+        std::unordered_map<std::string_view, int> catIdx;
+        std::vector<std::string_view> catViews;
+        prodMap.init(std::max<size_t>(1024, prodText.size() / 8));
+        std::string buf = prodText;
+        buf.append(64, '\0');
+        const char* nl = (const char*)memchr(buf.data(), '\n', prodText.size());
+        if (nl)
+            for_rows<2>(nl + 1, buf.data() + prodText.size(), [&](const char** fp, const u32* fl) {
+                if (!fl[0]) return;
+                std::string_view c(fp[1], fl[1]);
+                auto it = catIdx.find(c);
+                int ci;
+                if (it == catIdx.end()) {
+                    ci = (int)cats.size();
+                    catIdx.emplace(c, ci);
+                    cats.emplace_back(c);
+                } else
+                    ci = it->second;
+                bool cn;
+                u64 k = enc_key(fp[0], fl[0], cn);
+                bool ins;
+                *prodMap.upsert(k, 0, ins) = ci;
+            });
     }
     const int UNKNOWN_CAT = (int)cats.size();
     cats.push_back("unknown");
@@ -628,12 +962,9 @@ int main() {
     HMap campMap;
     {
         std::string t = read_small(DATA + "/campaigns.csv");
-        campMap.init(1 << 12);
-        MFile m{t.data(), t.size()};
-        for_lines(m, 0, m.n, [&](const char* b, const char* e) {
-            const char* fp[2];
-            u32 fl[2];
-            if (!split<2>(b, e, fp, fl) || !fl[0]) return;
+        campMap.init(4096);
+        for_rows_text<2>(t, [&](const char** fp, const u32* fl) {
+            if (!fl[0]) return;
             bool cn;
             u64 k = enc_key(fp[0], fl[0], cn);
             bool ins;
@@ -646,403 +977,518 @@ int main() {
     }
     const int NCAMP = (int)campIds.size();
     const int ORGANIC = NCAMP;
+    mark("metadata");
 
-    // ---- map input files
-    auto evNames = list_csv(DATA + "/events");
-    auto ckNames = list_csv(DATA + "/clicks");
-    auto lkNames = list_csv(DATA + "/links");
-    std::vector<MFile> files;
-    for (auto& n : evNames) files.push_back(map_file(n));
-    for (auto& n : ckNames) files.push_back(map_file(n));
-    for (auto& n : lkNames) files.push_back(map_file(n));
-    const int EV0 = 0, CK0 = (int)evNames.size(), LK0 = CK0 + (int)ckNames.size();
+    // ---- parse links + events + clicks in one parallel pass
+    const int P = 512;   // event dedup partitions
+    const int K = 1024;  // person shards
+    auto ppart = [](u64 k) { return (int)(mix64(k) & (P - 1)); };
+    auto pshard = [](u64 k) { return (int)((mix64(k) >> 20) & (K - 1)); };
 
-    size_t totalBytes = 0;
-    for (auto& f : files) totalBytes += f.n;
-    size_t target = std::max<size_t>(1 << 20, std::min<size_t>(16 << 20, totalBytes / (NT * 16) + 1));
-
-    // per-thread registries of noncanonical strings
+    std::vector<std::vector<BList<u64>>> lkKeys(NT, std::vector<BList<u64>>(256));
+    std::vector<BList<PK>> lkPairs(NT);
+    std::vector<std::vector<BList<ER>>> evParts(NT, std::vector<BList<ER>>(P));
+    std::vector<BList<CK>> ckRaw(NT);
     std::vector<std::vector<std::pair<u64, std::string_view>>> regs(NT);
-    auto merge_regs = [&]() {
+    std::vector<std::vector<std::vector<char>>> keep(NT);
+    {
+        std::vector<Chunk> chunks;
+        size_t target = std::max<size_t>(1 << 20, std::min<size_t>(8 << 20, totalBytes / (NT * 12) + 1));
+        for (size_t f = 0; f < files.size(); f++) {
+            size_t n = files[f].n;
+            for (size_t s = 0; s < n; s += target) chunks.push_back({(int)f, kindOf[f], s, std::min(n, s + target)});
+        }
+        std::stable_sort(chunks.begin(), chunks.end(), [](const Chunk& a, const Chunk& b) {
+            if ((a.kind == 2) != (b.kind == 2)) return a.kind == 2;
+            return (a.e - a.s) > (b.e - b.s);
+        });
+        const i64 WSs = WS / SEC;
+        run_tasks(chunks.size(), [&](int t, size_t ci) {
+            static thread_local std::vector<char> buf;
+            const Chunk& c = chunks[ci];
+            const char *lb, *le;
+            if (!load_chunk(files[c.file], c.s, c.e, buf, lb, le)) return;
+            auto& rg = regs[t];
+            bool usedReg = false;
+            if (c.kind == 2) {
+                auto& keys = lkKeys[t];
+                auto& pairs = lkPairs[t];
+                for_rows<2>(lb, le, [&](const char** fp, const u32* fl) {
+                    if (!fl[0] || !fl[1]) return;
+                    bool ca, cb;
+                    u64 ka = enc_key(fp[0], fl[0], ca), kb = enc_key(fp[1], fl[1], cb);
+                    if (!ca) rg.push_back({ka, std::string_view(fp[0], fl[0])}), usedReg = true;
+                    if (!cb) rg.push_back({kb, std::string_view(fp[1], fl[1])}), usedReg = true;
+                    if (ka == kb) return;
+                    keys[region_of(ka)].push(ka, 512);
+                    keys[region_of(kb)].push(kb, 512);
+                    pairs.push({ka, kb}, 2048);
+                });
+            } else if (c.kind == 0) {
+                auto& parts = evParts[t];
+                for_rows<7>(lb, le, [&](const char** fp, const u32* fl) {
+                    if (!fl[0]) return;
+                    ER r;
+                    bool cn;
+                    r.eid = enc_key(fp[0], fl[0], cn);
+                    r.pad = 0;
+                    i64 ing = parse_ts(fp[3], fl[3]);
+                    i64 ingS = ing == TS_BAD ? INT32_MAX : ing / SEC - WSs;
+                    if (ingS > INT32_MAX) ingS = INT32_MAX;
+                    if (ingS < INT32_MIN) ingS = INT32_MIN;
+                    r.ing = (i32)ingS;
+                    r.ts = TS_INVALID;
+                    r.ukey = 0;
+                    r.packed = 0;
+                    do {
+                        if (!fl[1] || !fl[5]) break;
+                        i64 ts = parse_ts(fp[2], fl[2]);
+                        if (ts == TS_BAD || ts < WS || ts >= WE) break;
+                        if (ing == TS_BAD || ing - ts > DAYMS) break;
+                        const char* ty = fp[4];
+                        u32 tl = fl[4];
+                        bool purchase = false;
+                        if (tl == 4 && (memcmp(ty, "view", 4) == 0 || memcmp(ty, "cart", 4) == 0)) {
+                        } else if (tl == 8 && memcmp(ty, "purchase", 8) == 0) {
+                            purchase = true;
+                        } else
+                            break;
+                        u32 packed = 0;
+                        if (purchase) {
+                            const char* pr = fp[6];
+                            u32 pl = fl[6];
+                            if (!pl) break;
+                            bool ok = true;
+                            for (u32 q = 0; q < pl; q++)
+                                if (!dig(pr[q])) {
+                                    ok = false;
+                                    break;
+                                }
+                            if (!ok) break;
+                            u32 j = 0;
+                            while (j < pl && pr[j] == '0') j++;
+                            if (pl - j > 8) break;
+                            u32 price = 0;
+                            for (; j < pl; j++) price = price * 10 + (pr[j] - '0');
+                            if (price < 1 || price > 10000000) break;
+                            u64 pk = enc_key(fp[5], fl[5], cn);
+                            const u64* cv = prodMap.find(pk);
+                            u32 cat = cv ? (u32)*cv : (u32)UNKNOWN_CAT;
+                            packed = price | (cat << 24);
+                        }
+                        r.ukey = enc_key(fp[1], fl[1], cn);
+                        if (!cn) rg.push_back({r.ukey, std::string_view(fp[1], fl[1])}), usedReg = true;
+                        r.ts = (u32)(ts - BASE);
+                        r.packed = packed;
+                    } while (0);
+                    parts[ppart(r.eid)].push(r, 256);
+                });
+            } else {
+                auto& out = ckRaw[t];
+                for_rows<4>(lb, le, [&](const char** fp, const u32* fl) {
+                    if (!fl[0] || !fl[1] || !fl[2]) return;
+                    i64 ts = parse_ts(fp[3], fl[3]);
+                    if (ts == TS_BAD || ts < WS - WEEK || ts >= WE) return;
+                    bool cn;
+                    u64 ck = enc_key(fp[2], fl[2], cn);
+                    const u64* cv = campMap.find(ck);
+                    if (!cv) return;
+                    if (!cn && campIds[*cv] != std::string_view(fp[2], fl[2])) return;
+                    u64 uk = enc_key(fp[1], fl[1], cn);
+                    if (!cn) rg.push_back({uk, std::string_view(fp[1], fl[1])}), usedReg = true;
+                    u64 cid = enc_key(fp[0], fl[0], cn);
+                    if (!cn) rg.push_back({cid, std::string_view(fp[0], fl[0])}), usedReg = true;
+                    out.push({uk, cid, (u32)(ts - BASE), (u32)*cv}, 4096);
+                });
+            }
+            if (usedReg) {
+                // registry string_views point into buf: keep this buffer alive
+                keep[t].push_back(std::move(buf));
+                buf = std::vector<char>();
+            }
+        });
         for (auto& r : regs) {
             for (auto& kv : r) REG.emplace(kv.first, kv.second);
             r.clear();
         }
-    };
+    }
+    mark("parse");
 
-    // ---- links
-    HMap linkMap;  // user key -> person key
+    // ---- link table + union-find
+    RTable LT;
     {
-        std::vector<Chunk> chunks;
-        std::vector<MFile> lf(files.begin() + LK0, files.end());
-        make_chunks(lf, 2, target, chunks, LK0);
-        std::vector<std::vector<std::pair<u64, u64>>> pairs(NT);
-        std::atomic<size_t> next{0};
-        parallel(NT, [&](int t) {
-            auto& pv = pairs[t];
-            auto& rg = regs[t];
-            size_t i;
-            while ((i = next++) < chunks.size()) {
-                const Chunk& c = chunks[i];
-                for_lines(files[c.file], c.s, c.e, [&](const char* b, const char* e) {
-                    const char* fp[2];
-                    u32 fl[2];
-                    if (!split<2>(b, e, fp, fl) || !fl[0] || !fl[1]) return;
-                    bool ca, cb;
-                    u64 ka = enc_key(fp[0], fl[0], ca), kb = enc_key(fp[1], fl[1], cb);
-                    if (!ca) rg.push_back({ka, std::string_view(fp[0], fl[0])});
-                    if (!cb) rg.push_back({kb, std::string_view(fp[1], fl[1])});
-                    if (ka != kb) pv.push_back({ka, kb});
+        size_t upper = 0;
+        for (int t = 0; t < NT; t++)
+            for (int r = 0; r < 256; r++) upper += lkKeys[t][r].size();
+        LT.init(std::max<size_t>(upper * 3 / 2, 1 << 16));
+        std::vector<size_t> rcount(257, 0);
+        size_t rsize = LT.rmask + 1;
+        run_tasks(256, [&](int, size_t r) {
+            size_t local = 0;
+            for (int t = 0; t < NT; t++)
+                lkKeys[t][r].each([&](u64 k) {
+                    size_t i = LT.start(k);
+                    while (true) {
+                        if (LT.s[i].k == k) break;
+                        if (!LT.s[i].k) {
+                            LT.s[i].k = k;
+                            LT.s[i].v = local++;
+                            break;
+                        }
+                        i = LT.next(i);
+                    }
                 });
-            }
+            if (local >= rsize) die("link region overflow");
+            rcount[r] = local;
         });
-        merge_regs();
-        size_t np = 0;
-        for (auto& p : pairs) np += p.size();
-        linkMap.init(np * 2 + 16);
-        std::vector<u32> parent;
-        parent.reserve(np);
-        std::vector<u64> keyOf;
-        keyOf.reserve(np);
-        auto idx = [&](u64 k) -> u32 {
-            bool ins;
-            u64* v = linkMap.upsert(k, keyOf.size(), ins);
-            if (ins) {
-                parent.push_back((u32)keyOf.size());
-                keyOf.push_back(k);
-            }
-            return (u32)*v;
-        };
+        std::vector<size_t> rbase(257, 0);
+        for (int r = 0; r < 256; r++) rbase[r + 1] = rbase[r] + rcount[r];
+        size_t n = rbase[256];
+        std::vector<u64> keyOf(n);
+        run_tasks(256, [&](int, size_t r) {
+            Slot* s = LT.s + r * rsize;
+            for (size_t i = 0; i < rsize; i++)
+                if (s[i].k) keyOf[rbase[r] + s[i].v] = s[i].k;
+        });
+        std::vector<std::atomic<u32>> parent(n);
+        for (size_t i = 0; i < n; i++) parent[i].store((u32)i, std::memory_order_relaxed);
         auto find = [&](u32 x) {
-            while (parent[x] != x) {
-                parent[x] = parent[parent[x]];
-                x = parent[x];
+            while (true) {
+                u32 p = parent[x].load(std::memory_order_relaxed);
+                if (p == x) return x;
+                u32 gp = parent[p].load(std::memory_order_relaxed);
+                if (gp != p) parent[x].store(gp, std::memory_order_relaxed);  // path halving (benign)
+                x = gp;
             }
-            return x;
         };
-        for (auto& pv : pairs)
-            for (auto& pr : pv) {
-                u32 a = find(idx(pr.first)), b = find(idx(pr.second));
-                if (a != b) {
-                    if (a < b) std::swap(a, b);
-                    parent[a] = b;
+        auto gidx = [&](u64 k) -> u32 {
+            const Slot* sl = LT.find(k);
+            return (u32)(rbase[region_of(k)] + sl->v);
+        };
+        run_tasks(NT, [&](int, size_t t) {
+            lkPairs[t].each([&](const PK& pr) {
+                u32 a = gidx(pr.a), b = gidx(pr.b);
+                while (true) {
+                    a = find(a);
+                    b = find(b);
+                    if (a == b) break;
+                    if (a < b) std::swap(a, b);  // link larger root under smaller
+                    u32 exp = a;
+                    if (parent[a].compare_exchange_strong(exp, b, std::memory_order_relaxed)) break;
                 }
-            }
-        size_t n = keyOf.size();
+            });
+        });
+        std::vector<u32> root(n);
+        run_tasks(NT, [&](int, size_t t) {
+            size_t lo = n * t / NT, hi = n * (t + 1) / NT;
+            for (size_t i = lo; i < hi; i++) root[i] = find((u32)i);
+        });
         std::vector<u64> minKey(n, 0);
         for (size_t i = 0; i < n; i++) {
-            u32 r = find((u32)i);
+            u32 r = root[i];
             if (minKey[r] == 0 || key_less(keyOf[i], minKey[r])) minKey[r] = keyOf[i];
         }
-        for (size_t i = 0; i < n; i++) *(u64*)linkMap.find(keyOf[i]) = minKey[find((u32)i)];
-    }
-    auto person = [&](u64 ukey) -> u64 {
-        const u64* v = linkMap.find(ukey);
-        return v ? *v : ukey;
-    };
-
-    // ---- parse events + clicks
-    const int P = 256;  // event dedup partitions
-    const int K = 256;  // person shards
-    auto ppart = [](u64 k) { return (int)((k * 0x9E3779B97F4A7C15ULL) >> 56); };
-    auto pshard = [](u64 k) { return (int)(((k ^ (k >> 31)) * 0xD6E8FEB86659FD93ULL) >> 56); };
-
-    std::vector<std::vector<std::vector<ER>>> evParts(NT, std::vector<std::vector<ER>>(P));
-    std::vector<std::vector<std::vector<CR>>> ckShards(NT, std::vector<std::vector<CR>>(K));
-    {
-        std::vector<Chunk> chunks;
-        std::vector<MFile> ef(files.begin() + EV0, files.begin() + CK0);
-        std::vector<MFile> cf(files.begin() + CK0, files.begin() + LK0);
-        make_chunks(ef, 0, target, chunks, EV0);
-        make_chunks(cf, 1, target, chunks, CK0);
-        std::sort(chunks.begin(), chunks.end(),
-                  [](const Chunk& a, const Chunk& b) { return (a.e - a.s) > (b.e - b.s); });
-        std::atomic<size_t> next{0};
-        const i64 WSs = WS / SEC;
-        parallel(NT, [&](int t) {
-            auto& parts = evParts[t];
-            auto& shards = ckShards[t];
-            auto& rg = regs[t];
-            size_t i;
-            while ((i = next++) < chunks.size()) {
-                const Chunk& c = chunks[i];
-                if (c.kind == 0) {
-                    for_lines(files[c.file], c.s, c.e, [&](const char* b, const char* e) {
-                        const char* fp[7];
-                        u32 fl[7];
-                        if (!split<7>(b, e, fp, fl) || !fl[0]) return;
-                        ER r;
-                        bool ecn;
-                        r.eid = enc_key(fp[0], fl[0], ecn);
-                        r.pad = 0;
-                        i64 ing = parse_ts(fp[3], fl[3]);
-                        i64 ingS = ing == TS_BAD ? INT32_MAX : ing / SEC - WSs;
-                        if (ingS > INT32_MAX) ingS = INT32_MAX;
-                        if (ingS < INT32_MIN) ingS = INT32_MIN;
-                        r.ing = (i32)ingS;
-                        r.ts = TS_INVALID;
-                        r.ukey = 0;
-                        r.packed = 0;
-                        do {
-                            if (!fl[1] || !fl[5]) break;
-                            i64 ts = parse_ts(fp[2], fl[2]);
-                            if (ts == TS_BAD || ts < WS || ts >= WE) break;
-                            if (ing == TS_BAD || ing - ts > DAYMS) break;
-                            const char* ty = fp[4];
-                            u32 tl = fl[4];
-                            bool purchase = false;
-                            if (tl == 4 && memcmp(ty, "view", 4) == 0) {
-                            } else if (tl == 4 && memcmp(ty, "cart", 4) == 0) {
-                            } else if (tl == 8 && memcmp(ty, "purchase", 8) == 0) {
-                                purchase = true;
-                            } else
-                                break;
-                            u32 packed = 0;
-                            if (purchase) {
-                                const char* pr = fp[6];
-                                u32 pl = fl[6];
-                                if (!pl) break;
-                                u32 j = 0;
-                                bool ok = true;
-                                for (u32 q = 0; q < pl; q++)
-                                    if (!dig(pr[q])) {
-                                        ok = false;
-                                        break;
-                                    }
-                                if (!ok) break;
-                                while (j < pl && pr[j] == '0') j++;
-                                if (pl - j > 8) break;
-                                u32 price = 0;
-                                for (; j < pl; j++) price = price * 10 + (pr[j] - '0');
-                                if (price < 1 || price > 10000000) break;
-                                bool cn;
-                                u64 pk = enc_key(fp[5], fl[5], cn);
-                                const u64* cv = prodMap.find(pk);
-                                u32 cat = cv ? (u32)*cv : (u32)UNKNOWN_CAT;
-                                packed = price | (cat << 24);
-                            }
-                            bool cn;
-                            r.ukey = enc_key(fp[1], fl[1], cn);
-                            if (!cn) rg.push_back({r.ukey, std::string_view(fp[1], fl[1])});
-                            r.ts = (u32)(ts - BASE);
-                            r.packed = packed;
-                        } while (0);
-                        parts[ppart(r.eid)].push_back(r);
-                    });
-                } else {
-                    for_lines(files[c.file], c.s, c.e, [&](const char* b, const char* e) {
-                        const char* fp[4];
-                        u32 fl[4];
-                        if (!split<4>(b, e, fp, fl) || !fl[0] || !fl[1] || !fl[2]) return;
-                        i64 ts = parse_ts(fp[3], fl[3]);
-                        if (ts == TS_BAD || ts < WS - WEEK || ts >= WE) return;
-                        bool cn;
-                        u64 ck = enc_key(fp[2], fl[2], cn);
-                        const u64* cv = campMap.find(ck);
-                        if (!cv) return;
-                        // campaign keys could collide only if noncanonical; verify string
-                        if (!cn && campIds[*cv] != std::string_view(fp[2], fl[2])) return;
-                        u64 uk = enc_key(fp[1], fl[1], cn);
-                        if (!cn) rg.push_back({uk, std::string_view(fp[1], fl[1])});
-                        u64 cid = enc_key(fp[0], fl[0], cn);
-                        if (!cn) rg.push_back({cid, std::string_view(fp[0], fl[0])});
-                        u64 pk = person(uk);
-                        shards[pshard(pk)].push_back({pk, cid, (u32)(ts - BASE), (u32)*cv});
-                    });
-                }
-            }
+        run_tasks(256, [&](int, size_t r) {
+            Slot* s = LT.s + r * rsize;
+            for (size_t i = 0; i < rsize; i++)
+                if (s[i].k) s[i].v = minKey[root[rbase[r] + s[i].v]];
         });
-        merge_regs();
     }
+    mark("links");
 
-    // ---- dedup events per partition
-    std::vector<std::vector<std::vector<EV>>> evShards(NT, std::vector<std::vector<EV>>(K));
+    // ---- dedup events + resolve persons + scatter to person shards
+    std::vector<std::vector<BList<EV>>> evShards(NT, std::vector<BList<EV>>(K));
+    std::vector<std::vector<BList<CR>>> ckShards(NT, std::vector<BList<CR>>(K));
     {
-        std::atomic<int> next{0};
-        parallel(NT, [&](int t) {
-            HMap m;
-            std::vector<ER> buf;
-            auto& out = evShards[t];
-            int p;
-            while ((p = next++) < P) {
+        std::vector<typename BList<CK>::Blk*> ckBlocks;
+        for (int t = 0; t < NT; t++)
+            for (auto* b = ckRaw[t].head; b; b = b->next) ckBlocks.push_back(b);
+        const int PD = 16;
+        run_tasks(P + ckBlocks.size(), [&](int t, size_t task) {
+            static thread_local HMap m;
+            static thread_local std::vector<ER> buf;
+            static thread_local std::vector<u32> surv;
+            if (task < (size_t)P) {
+                int p = (int)task;
                 size_t n = 0;
                 for (int s = 0; s < NT; s++) n += evParts[s][p].size();
                 m.init(n + 16);
                 buf.clear();
                 buf.reserve(n);
-                for (int s = 0; s < NT; s++) {
-                    for (const ER& r : evParts[s][p]) {
+                for (int s = 0; s < NT; s++)
+                    evParts[s][p].each([&](const ER& r) {
                         bool ins;
                         u64* v = m.upsert(r.eid, buf.size(), ins);
                         if (ins)
                             buf.push_back(r);
                         else if (r.ing < buf[*v].ing)
                             buf[*v] = r;
-                    }
-                    std::vector<ER>().swap(evParts[s][p]);
+                    });
+                surv.clear();
+                for (u32 i = 0; i < buf.size(); i++)
+                    if (buf[i].ts != TS_INVALID) surv.push_back(i);
+                auto& out = evShards[t];
+                size_t ns = surv.size();
+                for (size_t i = 0; i < ns; i++) {
+                    if (i + PD < ns) LT.prefetch(buf[surv[i + PD]].ukey);
+                    const ER& r = buf[surv[i]];
+                    const Slot* sl = LT.find(r.ukey);
+                    u64 pk = sl ? sl->v : r.ukey;
+                    out[pshard(pk)].push({pk, r.ts, r.packed}, 256);
                 }
-                for (const ER& r : buf) {
-                    if (r.ts == TS_INVALID) continue;
-                    u64 pk = person(r.ukey);
-                    out[pshard(pk)].push_back({pk, r.ts, r.packed});
+            } else {
+                auto* b = ckBlocks[task - P];
+                CK* it = b->items();
+                u32 nb = b->n;
+                auto& out = ckShards[t];
+                for (u32 i = 0; i < nb; i++) {
+                    if (i + PD < nb) LT.prefetch(it[i + PD].ukey);
+                    const Slot* sl = LT.find(it[i].ukey);
+                    u64 pk = sl ? sl->v : it[i].ukey;
+                    out[pshard(pk)].push({pk, it[i].cid, it[i].ts, it[i].camp}, 170);
                 }
             }
         });
     }
+    mark("dedup+resolve");
 
     // ---- sessionize + attribute per shard
     const size_t CAMPW = (size_t)(NCAMP + 1) * NDAYS;
-    std::vector<std::vector<URow>> urows(NT);
-    // per thread: [4][NCAMP+1][NDAYS] : sessions, purchasing, revenue, assisted
-    std::vector<std::vector<u64>> camp(NT, std::vector<u64>(CAMPW * 4, 0));
+    std::vector<std::vector<u64>> camp(NT);
+    std::vector<std::vector<PCol>> ucols(NT);
+    std::vector<size_t> urowsN(NT, 0);
     {
-        std::atomic<int> next{0};
         const u32 W = (u32)WEEK, GAP = 1800000;
-        const u32 DAYOFF = (u32)(WS - BASE);  // rel ts of window start
-        const i64 BASE_DAY_SHIFT = WS - DAY0 * DAYMS;  // window start offset within its day
-        parallel(NT, [&](int t) {
-            std::vector<EV> E;
-            std::vector<CR> C;
-            auto& rows = urows[t];
-            u64* cs = camp[t].data();
-            u64* cp = cs + CAMPW;
-            u64* cr = cs + 2 * CAMPW;
-            u64* ca = cs + 3 * CAMPW;
-            std::vector<u32> cnt(NCAMP + 1, 0), since(NCAMP + 1, 0);
-            std::vector<u64> catSum(cats.size(), 0);
+        const u32 DAYOFF = (u32)(WS - BASE);
+        const i64 BASE_DAY_SHIFT = WS - DAY0 * DAYMS;
+        for (int t = 0; t < NT; t++) {
+            camp[t].assign(CAMPW * 4, 0);
+            auto& cols = ucols[t];
+            cols.resize(6);
+            cols[0].name = "user_id", cols[0].type = P_BYTES, cols[0].logical = 1;
+            cols[1].name = "day", cols[1].type = P_INT32, cols[1].logical = 6;
+            cols[2].name = "sessions", cols[2].type = P_INT64;
+            cols[3].name = "events", cols[3].type = P_INT64;
+            cols[4].name = "revenue_cents", cols[4].type = P_INT64;
+            cols[5].name = "top_category", cols[5].type = P_BYTES, cols[5].optional = true, cols[5].logical = 1;
+        }
+        run_tasks(K, [&](int t, size_t s) {
+            static thread_local std::vector<u64> pkeys, E2, tmp;
+            static thread_local std::vector<u32> evIdx, ckIdx, eoff, coff;
+            static thread_local std::vector<C2> Cv;
+            static thread_local std::vector<u32> cnt, since;
+            static thread_local std::vector<u64> catSum;
             struct Sess {
                 u32 start;
                 int day;
                 bool purchase;
                 u64 rev;
             };
-            std::vector<Sess> S;
-            int s;
-            while ((s = next++) < K) {
-                E.clear();
-                C.clear();
-                for (int q = 0; q < NT; q++) {
-                    auto& v = evShards[q][s];
-                    E.insert(E.end(), v.begin(), v.end());
-                    std::vector<EV>().swap(v);
-                    auto& w = ckShards[q][s];
-                    C.insert(C.end(), w.begin(), w.end());
-                    std::vector<CR>().swap(w);
+            static thread_local std::vector<Sess> S;
+            static thread_local HMap pm;
+            if (cnt.size() != (size_t)NCAMP + 1) {
+                cnt.assign(NCAMP + 1, 0);
+                since.assign(NCAMP + 1, 0);
+            }
+            if (catSum.size() != cats.size()) catSum.assign(cats.size(), 0);
+            auto& cols = ucols[t];
+            u64* cs = camp[t].data();
+            u64* cp = cs + CAMPW;
+            u64* cr = cs + 2 * CAMPW;
+            u64* ca = cs + 3 * CAMPW;
+
+            size_t ne = 0, nc = 0;
+            for (int q = 0; q < NT; q++) ne += evShards[q][s].size(), nc += ckShards[q][s].size();
+            if (!ne) return;
+            pm.init(ne / 16 + 256);
+            pkeys.clear();
+            evIdx.resize(ne);
+            eoff.clear();
+            size_t at = 0;
+            for (int q = 0; q < NT; q++)
+                evShards[q][s].each([&](const EV& e) {
+                    bool ins;
+                    u64* v = pm.upsert(e.pkey, pkeys.size(), ins);
+                    u32 pi = (u32)*v;
+                    if (ins) {
+                        pkeys.push_back(e.pkey);
+                        eoff.push_back(0);
+                        if (pkeys.size() * 2 > pm.k.size()) {  // grow: rehash all persons
+                            pm.init(pkeys.size() * 2);
+                            for (size_t i = 0; i < pkeys.size(); i++) {
+                                bool in2;
+                                *pm.upsert(pkeys[i], i, in2) = i;
+                            }
+                        }
+                    }
+                    evIdx[at++] = pi;
+                    eoff[pi]++;
+                });
+            size_t np = pkeys.size();
+            // prefix sums (eoff becomes start offsets, size np+1)
+            eoff.push_back(0);
+            {
+                u32 sum = 0;
+                for (size_t i = 0; i <= np; i++) {
+                    u32 c = eoff[i];
+                    eoff[i] = sum;
+                    sum += c;
                 }
-                std::sort(E.begin(), E.end(), [](const EV& a, const EV& b) {
-                    return a.pkey != b.pkey ? a.pkey < b.pkey : a.ts < b.ts;
+            }
+            E2.resize(ne);
+            {
+                std::vector<u32>& wp = coff;  // reuse as write positions
+                wp.assign(eoff.begin(), eoff.end());
+                at = 0;
+                for (int q = 0; q < NT; q++)
+                    evShards[q][s].each([&](const EV& e) {
+                        u32 pi = evIdx[at++];
+                        E2[wp[pi]++] = ((u64)e.ts << 32) | e.packed;
+                    });
+            }
+            // clicks of these persons
+            std::vector<u32> cstart(np + 1, 0);
+            ckIdx.resize(nc);
+            at = 0;
+            for (int q = 0; q < NT; q++)
+                ckShards[q][s].each([&](const CR& c) {
+                    const u64* v = pm.find(c.pkey);
+                    u32 pi = v ? (u32)*v : 0xFFFFFFFFu;
+                    ckIdx[at++] = pi;
+                    if (v) cstart[pi]++;
                 });
-                std::sort(C.begin(), C.end(), [](const CR& a, const CR& b) {
-                    if (a.pkey != b.pkey) return a.pkey < b.pkey;
-                    if (a.ts != b.ts) return a.ts < b.ts;
-                    return key_less(a.cid, b.cid);
-                });
-                size_t ci = 0;
-                size_t i = 0;
-                while (i < E.size()) {
-                    u64 pk = E[i].pkey;
-                    size_t j = i;
-                    while (j < E.size() && E[j].pkey == pk) j++;
-                    while (ci < C.size() && C[ci].pkey < pk) ci++;
-                    size_t c0 = ci;
-                    while (ci < C.size() && C[ci].pkey == pk) ci++;
-                    size_t c1 = ci;
-                    // sessions
-                    S.clear();
-                    int curDay = -1;
-                    URow ur{};
-                    bool anyCat = false;
-                    auto flush_day = [&]() {
-                        if (curDay < 0) return;
-                        ur.pkey = pk;
-                        ur.day = (i32)(DAY0 + curDay);
-                        ur.topcat = -1;
-                        if (anyCat) {
-                            int best = -1;
-                            for (size_t c = 0; c < catSum.size(); c++) {
-                                if (!catSum[c]) continue;
-                                if (best < 0 || catSum[c] > catSum[best] ||
-                                    (catSum[c] == catSum[best] && catRank[c] < catRank[best]))
-                                    best = (int)c;
-                            }
-                            ur.topcat = best;
-                            std::fill(catSum.begin(), catSum.end(), 0);
+            {
+                u32 sum = 0;
+                for (size_t i = 0; i <= np; i++) {
+                    u32 c = cstart[i];
+                    cstart[i] = sum;
+                    sum += c;
+                }
+            }
+            Cv.resize(cstart[np]);
+            {
+                std::vector<u32> wp(cstart.begin(), cstart.end());
+                at = 0;
+                for (int q = 0; q < NT; q++)
+                    ckShards[q][s].each([&](const CR& c) {
+                        u32 pi = ckIdx[at++];
+                        if (pi != 0xFFFFFFFFu) Cv[wp[pi]++] = {c.ts, c.camp, c.cid};
+                    });
+            }
+
+            for (size_t pi = 0; pi < np; pi++) {
+                u64 pk = pkeys[pi];
+                u64* Ep = E2.data() + eoff[pi];
+                size_t en = eoff[pi + 1] - eoff[pi];
+                sort_events(Ep, en, tmp);
+                C2* Cp = Cv.data() + cstart[pi];
+                size_t cn = cstart[pi + 1] - cstart[pi];
+                if (cn > 1)
+                    std::sort(Cp, Cp + cn, [](const C2& a, const C2& b) {
+                        if (a.ts != b.ts) return a.ts < b.ts;
+                        return key_less(a.cid, b.cid);
+                    });
+                // sessions + user-day rows
+                S.clear();
+                int curDay = -1;
+                u64 dSess = 0, dEv = 0, dRev = 0;
+                bool anyCat = false;
+                auto flush_day = [&]() {
+                    if (curDay < 0) return;
+                    col_key(cols[0], pk);
+                    col_i32(cols[1], (i32)(DAY0 + curDay));
+                    col_i64(cols[2], (i64)dSess);
+                    col_i64(cols[3], (i64)dEv);
+                    col_i64(cols[4], (i64)dRev);
+                    if (anyCat) {
+                        int best = -1;
+                        for (size_t c = 0; c < catSum.size(); c++) {
+                            if (!catSum[c]) continue;
+                            if (best < 0 || catSum[c] > catSum[best] ||
+                                (catSum[c] == catSum[best] && catRank[c] < catRank[best]))
+                                best = (int)c;
                         }
-                        rows.push_back(ur);
-                    };
-                    size_t k = i;
-                    while (k < j) {
-                        u32 st = E[k].ts;
-                        int day = (int)(((i64)(st - DAYOFF) + BASE_DAY_SHIFT) / DAYMS);
-                        if (day != curDay) {
-                            flush_day();
-                            curDay = day;
-                            ur = URow{};
-                            anyCat = false;
-                        }
-                        Sess se{st, day, false, 0};
-                        u32 prev = st;
-                        u64 nev = 0;
-                        while (k < j && E[k].ts - prev <= GAP) {
-                            prev = E[k].ts;
-                            u32 pkd = E[k].packed;
-                            if (pkd) {
-                                u32 price = pkd & 0xFFFFFF;
-                                se.purchase = true;
-                                se.rev += price;
-                                catSum[pkd >> 24] += price;
-                                anyCat = true;
-                            }
-                            nev++;
-                            k++;
-                        }
-                        ur.sessions++;
-                        ur.events += nev;
-                        ur.revenue += se.rev;
-                        S.push_back(se);
+                        col_str(cols[5], cats[best]);
+                        cols[5].def.push_back(1);
+                        std::fill(catSum.begin(), catSum.end(), 0);
+                    } else
+                        cols[5].def.push_back(0);
+                    urowsN[t]++;
+                };
+                size_t k = 0;
+                while (k < en) {
+                    u32 st = (u32)(Ep[k] >> 32);
+                    int day = (int)(((i64)(st - DAYOFF) + BASE_DAY_SHIFT) / DAYMS);
+                    if (day != curDay) {
+                        flush_day();
+                        curDay = day;
+                        dSess = dEv = dRev = 0;
+                        anyCat = false;
                     }
-                    flush_day();
-                    // attribution
-                    size_t lo = c0, hi = c0;
-                    u32 nS = (u32)S.size();
-                    auto close = [&](u32 c, u32 a, u32 b) {
-                        for (u32 x = a; x < b; x++) ca[(size_t)c * NDAYS + S[x].day]++;
-                    };
-                    for (u32 si = 0; si < nS; si++) {
-                        u32 st = S[si].start;
-                        while (hi < c1 && C[hi].ts <= st) {
-                            u32 c = C[hi].camp;
-                            if (cnt[c]++ == 0) since[c] = si;
-                            hi++;
+                    Sess se{st, day, false, 0};
+                    u32 prev = st;
+                    u64 nev = 0;
+                    while (k < en) {
+                        u32 ts = (u32)(Ep[k] >> 32);
+                        if (ts - prev > GAP) break;
+                        prev = ts;
+                        u32 pkd = (u32)Ep[k];
+                        if (pkd) {
+                            u32 price = pkd & 0xFFFFFF;
+                            se.purchase = true;
+                            se.rev += price;
+                            catSum[pkd >> 24] += price;
+                            anyCat = true;
                         }
-                        while (lo < hi && C[lo].ts + W < st) {
-                            u32 c = C[lo].camp;
-                            if (--cnt[c] == 0) close(c, since[c], si);
-                            lo++;
-                        }
-                        u32 cc = ORGANIC;
-                        if (lo < hi) {
-                            size_t q = hi - 1;
-                            while (q > lo && C[q - 1].ts == C[q].ts) q--;
-                            cc = C[q].camp;
-                        }
-                        size_t o = (size_t)cc * NDAYS + S[si].day;
-                        cs[o]++;
-                        if (S[si].purchase) cp[o]++;
-                        cr[o] += S[si].rev;
+                        nev++;
+                        k++;
                     }
-                    for (size_t q = lo; q < hi; q++) {
-                        u32 c = C[q].camp;
-                        if (cnt[c]) {
-                            close(c, since[c], nS);
-                            cnt[c] = 0;
-                        }
+                    dSess++;
+                    dEv += nev;
+                    dRev += se.rev;
+                    S.push_back(se);
+                }
+                flush_day();
+                // attribution
+                size_t lo = 0, hi = 0;
+                u32 nS = (u32)S.size();
+                auto close = [&](u32 c, u32 a, u32 b) {
+                    for (u32 x = a; x < b; x++) ca[(size_t)c * NDAYS + S[x].day]++;
+                };
+                for (u32 si = 0; si < nS; si++) {
+                    u32 st = S[si].start;
+                    while (hi < cn && Cp[hi].ts <= st) {
+                        u32 c = Cp[hi].camp;
+                        if (cnt[c]++ == 0) since[c] = si;
+                        hi++;
                     }
-                    i = j;
+                    while (lo < hi && Cp[lo].ts + W < st) {
+                        u32 c = Cp[lo].camp;
+                        if (--cnt[c] == 0) close(c, since[c], si);
+                        lo++;
+                    }
+                    u32 cc = ORGANIC;
+                    if (lo < hi) {
+                        size_t q = hi - 1;
+                        while (q > lo && Cp[q - 1].ts == Cp[q].ts) q--;
+                        cc = Cp[q].camp;
+                    }
+                    size_t o = (size_t)cc * NDAYS + S[si].day;
+                    cs[o]++;
+                    if (S[si].purchase) cp[o]++;
+                    cr[o] += S[si].rev;
+                }
+                for (size_t q = lo; q < hi; q++) {
+                    u32 c = Cp[q].camp;
+                    if (cnt[c]) {
+                        close(c, since[c], nS);
+                        cnt[c] = 0;
+                    }
                 }
             }
         });
     }
+    mark("sessionize");
 
     // ---- write outputs
     std::string udir = OUT + "/user_daily", cdir = OUT + "/campaign_daily";
@@ -1050,43 +1496,23 @@ int main() {
     mkdir(udir.c_str(), 0777);
     mkdir(cdir.c_str(), 0777);
     size_t totalRows = 0;
-    for (auto& r : urows) totalRows += r.size();
+    for (auto n : urowsN) totalRows += n;
     std::vector<std::thread> writers;
     for (int t = 0; t < NT; t++) {
-        if (urows[t].empty() && !(t == 0 && totalRows == 0)) continue;
+        if (!urowsN[t] && !(t == 0 && totalRows == 0)) continue;
         writers.emplace_back([&, t]() {
-            auto& rows = urows[t];
-            std::vector<PCol> cols(6);
-            cols[0] = {"user_id", P_BYTES, false, 1};
-            cols[1] = {"day", P_INT32, false, 6};
-            cols[2] = {"sessions", P_INT64, false, 0};
-            cols[3] = {"events", P_INT64, false, 0};
-            cols[4] = {"revenue_cents", P_INT64, false, 0};
-            cols[5] = {"top_category", P_BYTES, true, 1};
-            for (auto& r : rows) {
-                col_str(cols[0], key_str(r.pkey));
-                col_i32(cols[1], r.day);
-                col_i64(cols[2], (i64)r.sessions);
-                col_i64(cols[3], (i64)r.events);
-                col_i64(cols[4], (i64)r.revenue);
-                if (r.topcat >= 0) {
-                    col_str(cols[5], cats[r.topcat]);
-                    cols[5].def.push_back(1);
-                } else
-                    cols[5].def.push_back(0);
-            }
-            write_parquet(udir + "/part-" + std::to_string(t) + ".parquet", cols, rows.size());
+            write_parquet(udir + "/part-" + std::to_string(t) + ".parquet", ucols[t], urowsN[t]);
         });
     }
     {
         std::vector<PCol> cols(7);
-        cols[0] = {"campaign_id", P_BYTES, false, 1};
-        cols[1] = {"channel", P_BYTES, false, 1};
-        cols[2] = {"day", P_INT32, false, 6};
-        cols[3] = {"sessions", P_INT64, false, 0};
-        cols[4] = {"purchasing_sessions", P_INT64, false, 0};
-        cols[5] = {"revenue_cents", P_INT64, false, 0};
-        cols[6] = {"assisted_sessions", P_INT64, false, 0};
+        cols[0].name = "campaign_id", cols[0].type = P_BYTES, cols[0].logical = 1;
+        cols[1].name = "channel", cols[1].type = P_BYTES, cols[1].logical = 1;
+        cols[2].name = "day", cols[2].type = P_INT32, cols[2].logical = 6;
+        cols[3].name = "sessions", cols[3].type = P_INT64;
+        cols[4].name = "purchasing_sessions", cols[4].type = P_INT64;
+        cols[5].name = "revenue_cents", cols[5].type = P_INT64;
+        cols[6].name = "assisted_sessions", cols[6].type = P_INT64;
         size_t n = 0;
         for (int c = 0; c <= NCAMP; c++)
             for (int d = 0; d < NDAYS; d++) {
@@ -1107,6 +1533,6 @@ int main() {
         write_parquet(cdir + "/part-0.parquet", cols, n);
     }
     for (auto& w : writers) w.join();
-    fflush(stdout);
+    mark("done");
     _exit(0);
 }
