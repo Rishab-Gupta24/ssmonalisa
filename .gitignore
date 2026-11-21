@@ -1,0 +1,6 @@
+dev/
+out/
+dev-answer/
+bin/
+*.o
+__pycache__/
