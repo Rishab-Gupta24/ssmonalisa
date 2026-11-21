@@ -337,23 +337,26 @@ static inline bool swar_digits(u64 x, u64 m) {
 }
 
 // Same result as parse_ts, faster for F1/F2 dates near the window.
-static inline i64 parse_ts_fast(const char* s, size_t n) {
+__attribute__((always_inline)) static inline i64 parse_ts_fast(const char* s, size_t n) {
     if (n == 20 || n == 25) {
-        u64 a, b;
-        memcpy(&a, s, 8);
-        memcpy(&b, s + 8, 8);
-        const u64 SEPA = ((u64)'-' << 32) | ((u64)'-' << 56), SEPB = ((u64)'T' << 16) | ((u64)':' << 40);
-        if ((a & ~DIG_A) == SEPA && (b & ~DIG_B) == SEPB && swar_digits(a, DIG_A) && swar_digits(b, DIG_B) &&
-            s[16] == ':' && dig(s[17]) && dig(s[18])) {
-            // all date/time digit pairs at once: byte i of t = 10*digit_i + digit_{i+1}
-            const u64 Z = 0x3030303030303030ULL;
-            u64 va = (a - (Z & DIG_A)) & DIG_A, vb = (b - (Z & DIG_B)) & DIG_B;
-            u64 ta = va * 10 + (va >> 8), tb = vb * 10 + (vb >> 8);
-            int mo = (int)((ta >> 40) & 0xFF), d = (int)(tb & 0xFF);
+        // "YYYY-MM-DDTHH:MM" in one 16-byte load: separators must match, every other byte is a digit
+        const __m128i TPL = _mm_setr_epi8(0, 0, 0, 0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0);
+        const __m128i SEPM = _mm_setr_epi8(0, 0, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0);
+        __m128i v = _mm_loadu_si128((const __m128i*)s);
+        __m128i dg = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+        __m128i digok = _mm_cmpeq_epi8(_mm_min_epu8(dg, _mm_set1_epi8(9)), dg);
+        __m128i ok = _mm_or_si128(_mm_and_si128(_mm_cmpeq_epi8(v, TPL), SEPM), _mm_andnot_si128(SEPM, digok));
+        if (_mm_movemask_epi8(ok) == 0xFFFF && s[16] == ':' && dig(s[17]) && dig(s[18])) {
+            // gather the 12 digits into pairs, then 10*a+b per pair: YYhi YYlo MM DD HH MI
+            __m128i g = _mm_shuffle_epi8(dg, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+            __m128i p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+            u64 p0 = (u64)_mm_cvtsi128_si64(p);
+            u32 p1 = (u32)_mm_extract_epi32(p, 2);
+            int mo = (int)((p0 >> 32) & 0xFFFF), d = (int)(p0 >> 48);
             int idx = mo * 32 + d;
-            i32 y = (i32)(ta & 0xFF) * 100 + (i32)((ta >> 16) & 0xFF);
+            i32 y = (i32)(p0 & 0xFFFF) * 100 + (i32)((p0 >> 16) & 0xFFFF);
             if (mo <= 12 && d <= 31 && DT_YEAR[idx] == y) {
-                int h = (int)((tb >> 24) & 0xFF), mi = (int)((tb >> 48) & 0xFF), se = d2(s + 17);
+                int h = (int)(p1 & 0xFFFF), mi = (int)(p1 >> 16), se = d2(s + 17);
                 if (h > 23 || mi > 59 || se > 59) return TS_BAD;
                 i64 off = 0;
                 if (n == 20) {
@@ -425,8 +428,37 @@ static inline u64 hash_bytes(const char* s, size_t n) {
     return mix64(h);
 }
 
-// SWAR + pext version of enc_key_ref. Reads up to 8 bytes past s+1 (buffers are padded).
-static inline u64 enc_key(const char* s, size_t n, bool& canon) {
+// SSE version of enc_key_ref: pshufb nibble lookups classify and code the (up to 8) bytes after
+// the first character; bzhi trims to the length; bswap+pext pack the 6-bit codes first-char-high.
+// Reads 8 bytes past s+1 (buffers are padded).
+__attribute__((noinline, cold)) static u64 enc_key_slow(const char* s, size_t n, bool& canon) {
+    canon = false;
+    return hash_bytes(s, n) | NONCANON;
+}
+__attribute__((always_inline)) static inline u64 enc_key(const char* s, size_t n, bool& canon) {
+    if (n - 1 <= 8 && (unsigned)(s[0] - 'a') < 26) {
+        // valid iff LUT_LO[lo] & LUT_HI[hi]: hi 3 -> digits (lo 0..9), hi 5 -> '_' (lo F),
+        // hi 6 -> 'a'..'o' (lo 1..F), hi 7 -> 'p'..'z' (lo 0..A); bytes >= 0x80 have no class
+        const __m128i LUT_LO = _mm_setr_epi8(9, 13, 13, 13, 13, 13, 13, 13, 13, 13, 12, 4, 4, 4, 4, 6);
+        const __m128i LUT_HI = _mm_setr_epi8(0, 0, 0, 1, 0, 2, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0);
+        // code = byte + DELTA[hi]: '0'..'9' -> 1..10, '_' -> 11, 'a'..'z' -> 12..37
+        const __m128i DELTA = _mm_setr_epi8(0, 0, 0, -0x2F, 0, -0x54, -0x55, -0x55, 0, 0, 0, 0, 0, 0, 0, 0);
+        const __m128i NIB = _mm_set1_epi8(0x0F);
+        __m128i v = _mm_loadl_epi64((const __m128i*)(s + 1));
+        __m128i lo = _mm_and_si128(v, NIB), hi = _mm_and_si128(_mm_srli_epi16(v, 4), NIB);
+        __m128i cls = _mm_and_si128(_mm_shuffle_epi8(LUT_LO, lo), _mm_shuffle_epi8(LUT_HI, hi));
+        u32 badm = (u32)_mm_movemask_epi8(_mm_cmpeq_epi8(cls, _mm_setzero_si128())) & ((1u << (n - 1)) - 1);
+        if (!badm) {
+            u64 code = (u64)_mm_cvtsi128_si64(_mm_add_epi8(v, _mm_shuffle_epi8(DELTA, hi)));
+            code = _bzhi_u64(code, (unsigned)(8 * (n - 1)));
+            canon = true;
+            return ((u64)(s[0] - 'a' + 1) << 48) | _pext_u64(__builtin_bswap64(code), 0x3F3F3F3F3F3F3F3FULL);
+        }
+    }
+    return enc_key_slow(s, n, canon);
+}
+
+[[maybe_unused]] static inline u64 enc_key_swar(const char* s, size_t n, bool& canon) {
     if (n >= 1 && n <= 9 && (unsigned)(s[0] - 'a') < 26) {
         u64 x;
         memcpy(&x, s + 1, 8);
@@ -792,6 +824,11 @@ static inline void for_rows(const char* b, const char* lim, F fn) {
     }
 }
 
+__attribute__((noinline)) u64 bench_enc(const char* s, size_t n) {
+    bool c;
+    return enc_key(s, n, c);
+}
+__attribute__((noinline)) i64 bench_ts(const char* s, size_t n) { return parse_ts_fast(s, n); }
 __attribute__((noinline)) u64 bench_walk(const char* b, const char* lim) {
     u64 x = 0;
     for_rows<7>(b, lim, [&](const char**, const u32* fl) { x += fl[0]; });
