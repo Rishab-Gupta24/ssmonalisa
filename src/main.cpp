@@ -621,6 +621,18 @@ static inline int region_of(u64 key) { return (int)(mix64(key) >> 56); }
 struct Masks {
     std::vector<u64> nl, cm, q;  // newlines, commas, quotes
 };
+// AVX-512BW: one 64-byte load and three compare-to-mask instructions per word (runtime-dispatched)
+static bool HAS_AVX512 = false;
+__attribute__((target("avx512f,avx512bw"))) static void build_masks_512(const char* b, size_t W, u64* nl, u64* cm,
+                                                                         u64* q) {
+    const __m512i NL = _mm512_set1_epi8('\n'), CM = _mm512_set1_epi8(','), QT = _mm512_set1_epi8('"');
+    for (size_t w = 0; w < W; w++) {
+        __m512i v = _mm512_loadu_si512((const void*)(b + (w << 6)));
+        nl[w] = _mm512_cmpeq_epi8_mask(v, NL);
+        cm[w] = _mm512_cmpeq_epi8_mask(v, CM);
+        q[w] = _mm512_cmpeq_epi8_mask(v, QT);
+    }
+}
 static void build_masks(const char* b, size_t N, Masks& M) {
     size_t W = (N >> 6) + 1;
     if (M.nl.size() < W + 3) {
@@ -628,10 +640,13 @@ static void build_masks(const char* b, size_t N, Masks& M) {
         M.cm.resize(W + 64);
         M.q.resize(W + 64);
     }
-    const __m256i NL = _mm256_set1_epi8('\n'), CM = _mm256_set1_epi8(','), QT = _mm256_set1_epi8('"');
     u64* nl = M.nl.data();
     u64* sep = M.cm.data();
     u64* q = M.q.data();
+    if (HAS_AVX512) {
+        build_masks_512(b, W, nl, sep, q);
+    } else {
+    const __m256i NL = _mm256_set1_epi8('\n'), CM = _mm256_set1_epi8(','), QT = _mm256_set1_epi8('"');
     for (size_t w = 0; w < W; w++) {
         __m256i v0 = _mm256_loadu_si256((const __m256i*)(b + (w << 6)));
         __m256i v1 = _mm256_loadu_si256((const __m256i*)(b + (w << 6) + 32));
@@ -644,6 +659,7 @@ static void build_masks(const char* b, size_t N, Masks& M) {
         nl[w] = n;
         sep[w] = c;  // commas only
         q[w] = qq;
+    }
     }
     u64 bit = 1ULL << (N & 63);
     nl[N >> 6] |= bit;  // virtual newline at N
@@ -1352,6 +1368,9 @@ int main() {
     if (TIMING) perf_init();
     if (getenv("SS_NOPOP")) POPULATE_INPUT = false;
     if (getenv("SS_NONT")) USE_NT = false;
+    __builtin_cpu_init();
+    // opt-in: on Cascade Lake, 512-bit ops lower the core clock license, which can cost more than they save
+    HAS_AVX512 = getenv("SS_AVX512") && __builtin_cpu_supports("avx512bw");
     init_ch();
     const char* ev;
     std::string DATA = (ev = getenv("DATA_DIR")) ? ev : "/data";
@@ -1577,7 +1596,6 @@ int main() {
                 auto& parts = evParts[t];
                 for_rows<7>(lb, le, [&](const char** fp, const u32* fl) {
                     if (!fl[0]) return;
-                    u64 q0 = TIMING ? __rdtsc() : 0;
                     ER r;
                     bool cn;
                     r.eid = enc_key(fp[0], fl[0], cn);
@@ -1587,16 +1605,12 @@ int main() {
                     if (ingS > INT32_MAX) ingS = INT32_MAX;
                     if (ingS < INT32_MIN) ingS = INT32_MIN;
                     r.ing = (i32)ingS;
-                    u64 q1 = TIMING ? __rdtsc() : 0;
-                    if (TIMING) CYCT[t][1] += q1 - q0;
                     r.ts = TS_INVALID;
                     r.ukey = 0;
                     r.packed = 0;
                     do {
                         if (!fl[1] || !fl[5]) break;
-                        u64 q2 = TIMING ? __rdtsc() : 0;
                         i64 ts = parse_ts_fast(fp[2], fl[2]);
-                        if (TIMING) CYCT[t][2] += __rdtsc() - q2;
                         if (ts == TS_BAD || ts < WS || ts >= WE) break;
                         if (ing == TS_BAD || ing - ts > DAYMS) break;
                         const char* ty = fp[4];
@@ -1630,18 +1644,14 @@ int main() {
                             u32 cat = cv ? (u32)*cv : (u32)UNKNOWN_CAT;
                             packed = price | (cat << 24);
                         }
-                        u64 q3 = TIMING ? __rdtsc() : 0;
                         r.ukey = enc_key(fp[1], fl[1], cn);
-                        if (TIMING) CYCT[t][3] += __rdtsc() - q3;
                         if (!cn) save(r.ukey, fp[1], fl[1]);
                         r.ts = (u32)(ts - BASE);
                         r.packed = packed;
                     } while (0);
-                    u64 q4 = TIMING ? __rdtsc() : 0;
                     int p = ppart(r.eid);
                     if (!USE_NT) {
                         parts[p].push(r, 256);
-                        if (TIMING) CYCT[t][4] += __rdtsc() - q4, CYCT[t][5] += __rdtsc() - q0;
                         return;
                     }
                     ER* sb = stage + (size_t)p * 4;
@@ -1654,11 +1664,6 @@ int main() {
                         _mm256_stream_si256(d + 1, _mm256_load_si256(src + 1));
                         _mm256_stream_si256(d + 2, _mm256_load_si256(src + 2));
                         _mm256_stream_si256(d + 3, _mm256_load_si256(src + 3));
-                    }
-                    if (TIMING) {
-                        u64 q5 = __rdtsc();
-                        CYCT[t][4] += q5 - q4;
-                        CYCT[t][5] += q5 - q0;
                     }
                 });
             } else {
@@ -1697,12 +1702,6 @@ int main() {
     }
     mark("parse");
     if (TIMING) {
-        const char* en[5] = {"eid+ingest", "ts", "ukey", "push", "handler total"};
-        for (int k = 0; k < 5; k++) {
-            u64 sum = 0;
-            for (int t = 0; t < NT; t++) sum += CYCT[t][1 + k], CYCT[t][1 + k] = 0;
-            fprintf(stderr, "    ev %-13s %8.1f Mtsc\n", en[k], sum / 1e6);
-        }
         const char* kn[3] = {"events", "clicks", "links"};
         for (int k = 0; k < 3; k++) {
             u64 sum = 0;
