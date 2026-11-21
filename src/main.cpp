@@ -1801,7 +1801,26 @@ int main() {
         for (int t = 0; t < NT; t++)
             for (auto* b = ckRaw[t].head; b; b = b->next) ckBlocks.push_back(b);
         const int PD = 16;
-        run_tasks(P + ckBlocks.size(), [&](int t, size_t task) {
+        std::atomic<size_t> nextTask{0};
+        const size_t ntasks = P + ckBlocks.size();
+        parallel(NT, [&](int t) {
+        // per-shard staging of 8 EVs (128 B), flushed to the shard lists with streaming stores
+        EV* stage = (EV*)ARENA.get((size_t)K * 8 * sizeof(EV));
+        std::vector<u8> scnt(K, 0);
+        auto emit = [&](int sh, const EV& e) {
+            EV* sb = stage + (size_t)sh * 8;
+            sb[scnt[sh]] = e;
+            if (++scnt[sh] == 8) {
+                scnt[sh] = 0;
+                __m256i* d = (__m256i*)evShards[t][sh].take(8, 256);
+                const __m256i* src = (const __m256i*)sb;
+                _mm256_stream_si256(d, _mm256_load_si256(src));
+                _mm256_stream_si256(d + 1, _mm256_load_si256(src + 1));
+                _mm256_stream_si256(d + 2, _mm256_load_si256(src + 2));
+                _mm256_stream_si256(d + 3, _mm256_load_si256(src + 3));
+            }
+        };
+        auto task_fn = [&](size_t task) {
             static thread_local HMap m;
             static thread_local std::vector<const ER*> buf, surv;
             if (task < (size_t)P) {
@@ -1829,14 +1848,13 @@ int main() {
                 surv.clear();
                 for (const ER* r : buf)
                     if (r->ts != TS_INVALID) surv.push_back(r);
-                auto& out = evShards[t];
                 size_t ns = surv.size();
                 for (size_t i = 0; i < ns; i++) {
                     if (i + PD < ns) LT.prefetch(surv[i + PD]->ukey);
                     const ER& r = *surv[i];
                     const Slot* sl = LT.find(r.ukey);
                     u64 pk = sl ? sl->v : r.ukey;
-                    out[pshard(pk)].push({pk, r.ts, r.packed}, 256);
+                    emit(pshard(pk), EV{pk, r.ts, r.packed});
                 }
             } else {
                 auto* b = ckBlocks[task - P];
@@ -1850,6 +1868,12 @@ int main() {
                     out[pshard(pk)].push({pk, it[i].cid, it[i].ts, it[i].camp}, 170);
                 }
             }
+        };
+        size_t tk;
+        while ((tk = nextTask.fetch_add(1, std::memory_order_relaxed)) < ntasks) task_fn(tk);
+        for (int sh = 0; sh < K; sh++)
+            for (int j = 0; j < scnt[sh]; j++) evShards[t][sh].push(stage[(size_t)sh * 8 + j], 256);
+        _mm_sfence();
         });
     }
     mark("dedup+resolve");
@@ -1873,6 +1897,19 @@ int main() {
             cols[3].name = "events", cols[3].type = P_INT64;
             cols[4].name = "revenue_cents", cols[4].type = P_INT64;
             cols[5].name = "top_category", cols[5].type = P_BYTES, cols[5].optional = true, cols[5].logical = 1;
+        }
+        {  // reserve output columns (~0.12 user-day rows per surviving event, measured on dev)
+            size_t ev = 0;
+            for (int q = 0; q < NT; q++)
+                for (int s2 = 0; s2 < K; s2++) ev += evShards[q][s2].size();
+            size_t rows = ev / 8 / NT + 1024;
+            for (int t = 0; t < NT; t++) {
+                ucols[t][0].data.reserve(rows * 16);
+                ucols[t][1].data.reserve(rows * 4);
+                for (int c = 2; c <= 4; c++) ucols[t][c].data.reserve(rows * 8);
+                ucols[t][5].data.reserve(rows * 6);
+                ucols[t][5].def.reserve(rows);
+            }
         }
         // largest shards first, so a whale or shared-device person doesn't start last
         std::vector<std::pair<size_t, int>> order(K);
@@ -2006,6 +2043,14 @@ int main() {
             }
             for (size_t pi = 0; pi < np; pi++) {
                 u64 pk = pkeys[pi];
+                // the person's name, length-prefixed, encoded once for all of their day rows
+                static thread_local std::string nm;
+                nm.assign(4, 0);
+                key_append(pk, nm);
+                {
+                    u32 nlen = (u32)(nm.size() - 4);
+                    memcpy(&nm[0], &nlen, 4);
+                }
                 u64* Ep = E2.data() + eoff[pi];
                 size_t en = eoff[pi + 1] - eoff[pi];
                 u64 tp0 = TIMING ? __rdtsc() : 0;
@@ -2020,7 +2065,7 @@ int main() {
                 bool anyCat = false;
                 auto flush_day = [&]() {
                     if (curDay < 0) return;
-                    col_key(cols[0], pk);
+                    cols[0].data.append(nm);
                     col_i32(cols[1], (i32)(DAY0 + curDay));
                     col_i64(cols[2], (i64)dSess);
                     col_i64(cols[3], (i64)dEv);
