@@ -34,6 +34,8 @@ static const i64 TS_BAD = INT64_MIN;
 static const u32 TS_INVALID = 0xFFFFFFFFu;
 
 static int NT = 8;
+static bool POPULATE_INPUT = true;
+static bool USE_NT = true;
 
 static void die(const char* m) {
     fprintf(stderr, "fatal: %s\n", m);
@@ -46,7 +48,7 @@ static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 // user-space instruction counter for this process and threads created later (debug only)
-static int PERF_FD = -1;
+static int PERF_FD = -1, PERF_FDS[4] = {-1, -1, -1, -1};
 static void perf_init() {
     struct {
         u32 type, size;
@@ -64,14 +66,18 @@ static void perf_init() {
     memset(&a, 0, sizeof a);
     a.type = 0;    // PERF_TYPE_HARDWARE
     a.size = 128;  // PERF_ATTR_SIZE_VER7 or so; kernel accepts smaller known sizes
-    a.config = 1;  // PERF_COUNT_HW_INSTRUCTIONS
     // flags: disabled=0, inherit=bit1, exclude_kernel=bit5, exclude_hv=bit6
     a.flags = (1ULL << 1) | (1ULL << 5) | (1ULL << 6);
-    PERF_FD = (int)syscall(298 /* perf_event_open */, &a, 0, -1, -1, 0);
+    const u64 cfg[4] = {1 /* instructions */, 0 /* cycles */, 5 /* branch misses */, 3 /* cache misses */};
+    for (int i = 0; i < 4; i++) {
+        a.config = cfg[i];
+        PERF_FDS[i] = (int)syscall(298 /* perf_event_open */, &a, 0, -1, -1, 0);
+    }
+    PERF_FD = PERF_FDS[0];
 }
-static u64 perf_read() {
+static u64 perf_read(int i = 0) {
     u64 v = 0;
-    if (PERF_FD >= 0 && read(PERF_FD, &v, 8) != 8) v = 0;
+    if (PERF_FDS[i] >= 0 && read(PERF_FDS[i], &v, 8) != 8) v = 0;
     return v;
 }
 static void mark(const char* what) {
@@ -79,8 +85,13 @@ static void mark(const char* what) {
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     double us = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, sy = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
-    fprintf(stderr, "%8.1f ms  user %7.1f  sys %7.1f  Minstr %8.1f  %s\n", (now_s() - T0) * 1000, us * 1000,
-            sy * 1000, perf_read() / 1e6, what);
+    static u64 last[4];
+    u64 v[4], d[4];
+    for (int i = 0; i < 4; i++) v[i] = perf_read(i), d[i] = v[i] - last[i], last[i] = v[i];
+    fprintf(stderr,
+            "%8.1f ms  user %7.1f  sys %7.1f | phase: Minstr %7.1f  Mcyc %7.1f  IPC %.2f  Mbrmiss %6.1f  Mcachemiss %6.1f  %s\n",
+            (now_s() - T0) * 1000, us * 1000, sy * 1000, d[0] / 1e6, d[1] / 1e6, d[1] ? (double)d[0] / d[1] : 0.0,
+            d[2] / 1e6, d[3] / 1e6, what);
 }
 
 // ---------------------------------------------------------------- threads
@@ -621,13 +632,12 @@ static inline u32 range_pop(const u64* q, size_t a, size_t b) {  // popcount of 
 static inline bool bit_at(const u64* m, size_t i) { return (m[i >> 6] >> (i & 63)) & 1; }
 
 // Calls fn(fp, fl) for every well-formed row (rules.md dialect) in [b, lim).
-static std::atomic<u64> DBG_LINES[8], DBG_BYTES[8];
+static u64 CYCT[64][16];  // per-thread cycle accumulators (SS_TIMING)
 template <int NF, class F>
 static inline void for_rows(const char* b, const char* lim, F fn) {
     static thread_local Masks M;
     size_t N = lim - b;
     if (!N) return;
-    if (TIMING) DBG_BYTES[NF].fetch_add(N, std::memory_order_relaxed);
     build_masks(b, N, M);
     const u64* nl = M.nl.data();
     const u64* sep = M.sep.data();
@@ -654,40 +664,27 @@ static inline void for_rows(const char* b, const char* lim, F fn) {
             k++;
         }
         pos = lineEnd + 1;
-        if (TIMING) DBG_LINES[NF].fetch_add(1, std::memory_order_relaxed);
         if (lineEnd == N && ls == N) break;  // nothing after the last newline
         if (k != NF - 1) continue;           // wrong field count (an empty line has one field)
         ends[NF - 1] = lineEnd;
+        // Branchless field extraction. A field is quoted iff it starts with '"' (the byte at an
+        // empty field's start is its separator, never a quote); then it must be >= 2 long and end
+        // with '"'. Any other quote makes the line's quote count exceed `expect`.
         u32 qc = range_pop(q, ls, lineEnd);
         size_t s = ls;
-        if (!qc) {
-            for (int f = 0; f < NF; f++) {
-                fp[f] = b + s;
-                fl[f] = (u32)(ends[f] - s);
-                s = ends[f] + 1;
-            }
-            fn(fp, fl);
-            continue;
-        }
-        u32 expect = 0;
-        bool ok = true;
+        u32 expect = 0, bad = 0;
         for (int f = 0; f < NF; f++) {
             size_t e = ends[f];
-            if (e > s && bit_at(q, s)) {
-                if (e - s < 2 || !bit_at(q, e - 1)) {
-                    ok = false;
-                    break;
-                }
-                expect += 2;
-                fp[f] = b + s + 1;
-                fl[f] = (u32)(e - s - 2);
-            } else {
-                fp[f] = b + s;
-                fl[f] = (u32)(e - s);
-            }
+            u32 len = (u32)(e - s);
+            u32 qs = (u32)bit_at(q, s);
+            u32 qe = (u32)bit_at(q, e - (len > 0));
+            bad |= qs & ((u32)(len < 2) | (qe ^ 1u));
+            expect += qs << 1;
+            fp[f] = b + s + qs;
+            fl[f] = len - (qs << 1);
             s = e + 1;
         }
-        if (ok && qc == expect) fn(fp, fl);
+        if (!bad && qc == expect) fn(fp, fl);
     }
 }
 
@@ -717,6 +714,10 @@ static bool load_chunk(const InFile& f, size_t s, size_t e, std::vector<char>& b
     if (f.map && e + EXTRA < f.n) {
         // zero-copy: every line we touch, plus 64 bytes of SIMD over-read, lies inside the file
         const char* b = f.map;
+        if (POPULATE_INPUT) {  // map this chunk's page-cache pages in one call instead of per-page faults
+            size_t a0 = rs & ~(size_t)4095, a1 = std::min(f.n, e + 4096);
+            madvise((void*)(b + a0), a1 - a0, 22 /* MADV_POPULATE_READ */);
+        }
         const char* nl0 = (const char*)memchr(b + rs, '\n', f.n - rs);
         if (!nl0) return false;
         const char* start = nl0 + 1;
@@ -1002,43 +1003,54 @@ static inline void col_key(PCol& c, u64 k) {
 }
 
 // ---------------------------------------------------------------- sorting helpers
-static void radix_sort_hi32(u64* a, size_t n, std::vector<u64>& tmp) {
-    // sorts by the high 32 bits (3 passes of 11 bits)
-    tmp.resize(n);
-    u64* src = a;
-    u64* dst = tmp.data();
-    for (int pass = 0; pass < 3; pass++) {
-        int sh = 32 + pass * 11;
-        size_t cnt[2048] = {0};
-        for (size_t i = 0; i < n; i++) cnt[(src[i] >> sh) & 2047]++;
-        size_t sum = 0;
-        for (int b = 0; b < 2048; b++) {
-            size_t c = cnt[b];
-            cnt[b] = sum;
-            sum += c;
-        }
-        for (size_t i = 0; i < n; i++) dst[cnt[(src[i] >> sh) & 2047]++] = src[i];
-        std::swap(src, dst);
-    }
-    if (src != a) memcpy(a, src, n * sizeof(u64));
-}
+struct SR {  // shard event row: ts, local person index, packed purchase
+    u32 ts, pi, packed;
+};
+struct SC {  // shard click row
+    u32 ts, pi, camp, pad;
+    u64 cid;
+};
 
-static inline void sort_events(u64* a, size_t n, std::vector<u64>& tmp) {
-    if (n <= 24) {
+// Stable sort of a[0..n) by .ts (full 32 bits: passes of 11, 11, 10 bits) using b as scratch.
+// Returns a pointer to the sorted data (a or b).
+template <class T>
+static T* radix_ts(T* a, T* b, size_t n) {
+    if (n <= 32) {  // insertion sort is stable too
         for (size_t i = 1; i < n; i++) {
-            u64 x = a[i];
+            T x = a[i];
             size_t j = i;
-            while (j > 0 && (a[j - 1] >> 32) > (x >> 32)) {
+            while (j > 0 && a[j - 1].ts > x.ts) {
                 a[j] = a[j - 1];
                 j--;
             }
             a[j] = x;
         }
-    } else if (n < 20000) {
-        std::sort(a, a + n, [](u64 x, u64 y) { return (x >> 32) < (y >> 32); });
-    } else {
-        radix_sort_hi32(a, n, tmp);
+        return a;
     }
+    static thread_local u32 h0[2048], h1[2048], h2[1024];
+    memset(h0, 0, sizeof h0);
+    memset(h1, 0, sizeof h1);
+    memset(h2, 0, sizeof h2);
+    for (size_t i = 0; i < n; i++) {
+        u32 x = a[i].ts;
+        h0[x & 2047]++;
+        h1[(x >> 11) & 2047]++;
+        h2[x >> 22]++;
+    }
+    u32 s0 = 0, s1 = 0, s2 = 0;
+    for (int k = 0; k < 2048; k++) {
+        u32 c0 = h0[k], c1 = h1[k];
+        h0[k] = s0, s0 += c0;
+        h1[k] = s1, s1 += c1;
+    }
+    for (int k = 0; k < 1024; k++) {
+        u32 c2 = h2[k];
+        h2[k] = s2, s2 += c2;
+    }
+    for (size_t i = 0; i < n; i++) b[h0[a[i].ts & 2047]++] = a[i];
+    for (size_t i = 0; i < n; i++) a[h1[(b[i].ts >> 11) & 2047]++] = b[i];
+    for (size_t i = 0; i < n; i++) b[h2[a[i].ts >> 22]++] = a[i];
+    return b;
 }
 
 // ---------------------------------------------------------------- self-test (SS_SELFTEST=1)
@@ -1122,6 +1134,8 @@ int main() {
     T0 = now_s();
     TIMING = getenv("SS_TIMING") != nullptr;
     if (TIMING) perf_init();
+    if (getenv("SS_NOPOP")) POPULATE_INPUT = false;
+    if (getenv("SS_NONT")) USE_NT = false;
     init_ch();
     const char* ev;
     std::string DATA = (ev = getenv("DATA_DIR")) ? ev : "/data";
@@ -1294,6 +1308,7 @@ int main() {
                 auto& parts = evParts[t];
                 for_rows<7>(lb, le, [&](const char** fp, const u32* fl) {
                     if (!fl[0]) return;
+                    u64 q0 = TIMING ? __rdtsc() : 0;
                     ER r;
                     bool cn;
                     r.eid = enc_key(fp[0], fl[0], cn);
@@ -1303,12 +1318,16 @@ int main() {
                     if (ingS > INT32_MAX) ingS = INT32_MAX;
                     if (ingS < INT32_MIN) ingS = INT32_MIN;
                     r.ing = (i32)ingS;
+                    u64 q1 = TIMING ? __rdtsc() : 0;
+                    if (TIMING) CYCT[t][1] += q1 - q0;
                     r.ts = TS_INVALID;
                     r.ukey = 0;
                     r.packed = 0;
                     do {
                         if (!fl[1] || !fl[5]) break;
+                        u64 q2 = TIMING ? __rdtsc() : 0;
                         i64 ts = parse_ts_fast(fp[2], fl[2]);
+                        if (TIMING) CYCT[t][2] += __rdtsc() - q2;
                         if (ts == TS_BAD || ts < WS || ts >= WE) break;
                         if (ing == TS_BAD || ing - ts > DAYMS) break;
                         const char* ty = fp[4];
@@ -1342,12 +1361,20 @@ int main() {
                             u32 cat = cv ? (u32)*cv : (u32)UNKNOWN_CAT;
                             packed = price | (cat << 24);
                         }
+                        u64 q3 = TIMING ? __rdtsc() : 0;
                         r.ukey = enc_key(fp[1], fl[1], cn);
+                        if (TIMING) CYCT[t][3] += __rdtsc() - q3;
                         if (!cn) save(r.ukey, fp[1], fl[1]);
                         r.ts = (u32)(ts - BASE);
                         r.packed = packed;
                     } while (0);
+                    u64 q4 = TIMING ? __rdtsc() : 0;
                     int p = ppart(r.eid);
+                    if (!USE_NT) {
+                        parts[p].push(r, 256);
+                        if (TIMING) CYCT[t][4] += __rdtsc() - q4, CYCT[t][5] += __rdtsc() - q0;
+                        return;
+                    }
                     ER* sb = stage + (size_t)p * 4;
                     sb[scnt[p]] = r;
                     if (++scnt[p] == 4) {
@@ -1358,6 +1385,11 @@ int main() {
                         _mm256_stream_si256(d + 1, _mm256_load_si256(src + 1));
                         _mm256_stream_si256(d + 2, _mm256_load_si256(src + 2));
                         _mm256_stream_si256(d + 3, _mm256_load_si256(src + 3));
+                    }
+                    if (TIMING) {
+                        u64 q5 = __rdtsc();
+                        CYCT[t][4] += q5 - q4;
+                        CYCT[t][5] += q5 - q0;
                     }
                 });
             } else {
@@ -1380,7 +1412,11 @@ int main() {
             }
         };
         size_t ci;
-        while ((ci = nextChunk.fetch_add(1, std::memory_order_relaxed)) < chunks.size()) body(ci);
+        while ((ci = nextChunk.fetch_add(1, std::memory_order_relaxed)) < chunks.size()) {
+            u64 c0 = TIMING ? __rdtsc() : 0;
+            body(ci);
+            if (TIMING) CYCT[t][8 + chunks[ci].kind] += __rdtsc() - c0;
+        }
         for (int p = 0; p < P; p++)
             for (int j = 0; j < scnt[p]; j++) evParts[t][p].push(stage[(size_t)p * 4 + j], 256);
         _mm_sfence();
@@ -1391,8 +1427,20 @@ int main() {
         }
     }
     mark("parse");
-    if (TIMING)
-        for (int f : {2, 4, 7}) fprintf(stderr, "  for_rows<%d>: %llu lines, %llu MB\n", f, (unsigned long long)DBG_LINES[f].load(), (unsigned long long)(DBG_BYTES[f].load() >> 20));
+    if (TIMING) {
+        const char* en[5] = {"eid+ingest", "ts", "ukey", "push", "handler total"};
+        for (int k = 0; k < 5; k++) {
+            u64 sum = 0;
+            for (int t = 0; t < NT; t++) sum += CYCT[t][1 + k], CYCT[t][1 + k] = 0;
+            fprintf(stderr, "    ev %-13s %8.1f Mtsc\n", en[k], sum / 1e6);
+        }
+        const char* kn[3] = {"events", "clicks", "links"};
+        for (int k = 0; k < 3; k++) {
+            u64 sum = 0;
+            for (int t = 0; t < NT; t++) sum += CYCT[t][8 + k];
+            fprintf(stderr, "    parse %-7s %8.1f Mtsc\n", kn[k], sum / 1e6);
+        }
+    }
 
     // ---- link table + union-find
     RTable LT;
@@ -1568,8 +1616,10 @@ int main() {
         if (TIMING) fprintf(stderr, "  largest shard %zu rows, median %zu\n", order[0].first, order[K / 2].first);
         run_tasks(K, [&](int t, size_t oi) {
             size_t s = (size_t)order[oi].second;
-            static thread_local std::vector<u64> pkeys, E2, tmp;
-            static thread_local std::vector<u32> evIdx, ckIdx, eoff, coff;
+            static thread_local std::vector<u64> pkeys, E2;
+            static thread_local std::vector<u32> eoff, coff;
+            static thread_local std::vector<SR> RA, RB;
+            static thread_local std::vector<SC> CA, CB;
             static thread_local std::vector<C2> Cv;
             static thread_local std::vector<u32> cnt, since, cstart, wp2;
             static thread_local std::vector<u64> catSum;
@@ -1592,12 +1642,14 @@ int main() {
             u64* cr = cs + 2 * CAMPW;
             u64* ca = cs + 3 * CAMPW;
 
+            u64 tc0 = TIMING ? __rdtsc() : 0;
             size_t ne = 0, nc = 0;
             for (int q = 0; q < NT; q++) ne += evShards[q][s].size(), nc += ckShards[q][s].size();
             if (!ne) return;
             pm.init(ne / 16 + 256);
             pkeys.clear();
-            evIdx.resize(ne);
+            RA.resize(ne);
+            RB.resize(ne);
             eoff.clear();
             size_t at = 0;
             for (int q = 0; q < NT; q++)
@@ -1616,7 +1668,7 @@ int main() {
                             }
                         }
                     }
-                    evIdx[at++] = pi;
+                    RA[at++] = {e.ts, pi, e.packed};
                     eoff[pi]++;
                 });
             size_t np = pkeys.size();
@@ -1630,28 +1682,34 @@ int main() {
                     sum += c;
                 }
             }
+            u64 tc1 = TIMING ? __rdtsc() : 0;
+            // sort the whole shard by ts (stable radix), then a stable scatter by person:
+            // every person's events come out grouped and already in ts order
             E2.resize(ne);
             {
-                std::vector<u32>& wp = coff;  // reuse as write positions
+                const SR* sorted = radix_ts(RA.data(), RB.data(), ne);
+                std::vector<u32>& wp = coff;  // write positions
                 wp.assign(eoff.begin(), eoff.end());
-                at = 0;
-                for (int q = 0; q < NT; q++)
-                    evShards[q][s].each([&](const EV& e) {
-                        u32 pi = evIdx[at++];
-                        E2[wp[pi]++] = ((u64)e.ts << 32) | e.packed;
-                    });
+                for (size_t i = 0; i < ne; i++) {
+                    const SR& r = sorted[i];
+                    E2[wp[r.pi]++] = ((u64)r.ts << 32) | r.packed;
+                }
             }
+            u64 tc2 = TIMING ? __rdtsc() : 0;
             // clicks of these persons
             cstart.assign(np + 1, 0);
-            ckIdx.resize(nc);
+            CA.resize(nc);
+            CB.resize(nc);
             at = 0;
             for (int q = 0; q < NT; q++)
                 ckShards[q][s].each([&](const CR& c) {
                     const u64* v = pm.find(c.pkey);
-                    u32 pi = v ? (u32)*v : 0xFFFFFFFFu;
-                    ckIdx[at++] = pi;
-                    if (v) cstart[pi]++;
+                    if (!v) return;  // person without surviving events
+                    u32 pi = (u32)*v;
+                    CA[at++] = {c.ts, pi, c.camp, 0, c.cid};
+                    cstart[pi]++;
                 });
+            size_t ncs = at;
             {
                 u32 sum = 0;
                 for (size_t i = 0; i <= np; i++) {
@@ -1662,28 +1720,30 @@ int main() {
             }
             Cv.resize(cstart[np]);
             {
+                const SC* sorted = radix_ts(CA.data(), CB.data(), ncs);
                 std::vector<u32>& wp = wp2;
                 wp.assign(cstart.begin(), cstart.end());
-                at = 0;
-                for (int q = 0; q < NT; q++)
-                    ckShards[q][s].each([&](const CR& c) {
-                        u32 pi = ckIdx[at++];
-                        if (pi != 0xFFFFFFFFu) Cv[wp[pi]++] = {c.ts, c.camp, c.cid};
-                    });
+                for (size_t i = 0; i < ncs; i++) {
+                    const SC& c = sorted[i];
+                    Cv[wp[c.pi]++] = {c.ts, c.camp, c.cid};
+                }
             }
 
+            if (TIMING) {
+                u64 tc3 = __rdtsc();
+                CYCT[t][0] += tc1 - tc0;
+                CYCT[t][1] += tc2 - tc1;
+                CYCT[t][2] += tc3 - tc2;
+            }
             for (size_t pi = 0; pi < np; pi++) {
                 u64 pk = pkeys[pi];
                 u64* Ep = E2.data() + eoff[pi];
                 size_t en = eoff[pi + 1] - eoff[pi];
-                sort_events(Ep, en, tmp);
+                u64 tp0 = TIMING ? __rdtsc() : 0;
+                // events and clicks are already in ts order (shard-level radix + stable scatter)
                 C2* Cp = Cv.data() + cstart[pi];
                 size_t cn = cstart[pi + 1] - cstart[pi];
-                if (cn > 1)
-                    std::sort(Cp, Cp + cn, [](const C2& a, const C2& b) {
-                        if (a.ts != b.ts) return a.ts < b.ts;
-                        return key_less(a.cid, b.cid);
-                    });
+                u64 tp1 = TIMING ? __rdtsc() : 0;
                 // sessions + user-day rows
                 S.clear();
                 int curDay = -1;
@@ -1745,6 +1805,7 @@ int main() {
                     S.push_back(se);
                 }
                 flush_day();
+                u64 tp2 = TIMING ? __rdtsc() : 0;
                 // attribution
                 size_t lo = 0, hi = 0;
                 u32 nS = (u32)S.size();
@@ -1765,9 +1826,13 @@ int main() {
                     }
                     u32 cc = ORGANIC;
                     if (lo < hi) {
-                        size_t q = hi - 1;
-                        while (q > lo && Cp[q - 1].ts == Cp[q].ts) q--;
-                        cc = Cp[q].camp;
+                        // latest ts wins; among equal ts, the byte-wise smallest click_id
+                        size_t q = hi - 1, best = q;
+                        while (q > lo && Cp[q - 1].ts == Cp[hi - 1].ts) {
+                            q--;
+                            if (key_less(Cp[q].cid, Cp[best].cid)) best = q;
+                        }
+                        cc = Cp[best].camp;
                     }
                     size_t o = (size_t)cc * NDAYS + S[si].day;
                     cs[o]++;
@@ -1781,10 +1846,24 @@ int main() {
                         cnt[c] = 0;
                     }
                 }
+                if (TIMING) {
+                    u64 tp3 = __rdtsc();
+                    CYCT[t][3] += tp1 - tp0;
+                    CYCT[t][4] += tp2 - tp1;
+                    CYCT[t][5] += tp3 - tp2;
+                }
             }
         });
     }
     mark("sessionize");
+    if (TIMING) {
+        const char* nm[6] = {"ev gather+count", "ev scatter", "clicks", "sort", "sessions+rows", "attribution"};
+        for (int k = 0; k < 6; k++) {
+            u64 sum = 0;
+            for (int t = 0; t < NT; t++) sum += CYCT[t][k];
+            fprintf(stderr, "    %-16s %7.1f Mcycles\n", nm[k], sum / 1e6);
+        }
+    }
 
     // ---- write outputs
     std::string udir = OUT + "/user_daily", cdir = OUT + "/campaign_daily";
