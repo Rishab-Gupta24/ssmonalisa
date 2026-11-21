@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 typedef uint64_t u64;
@@ -44,13 +45,42 @@ static bool TIMING = false;
 static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+// user-space instruction counter for this process and threads created later (debug only)
+static int PERF_FD = -1;
+static void perf_init() {
+    struct {
+        u32 type, size;
+        u64 config, sample_period, sample_type, read_format, flags;
+        u32 wakeup, bp_type;
+        u64 bp_addr, bp_len, branch_sample_type, sample_regs_user;
+        u32 sample_stack_user;
+        i32 clockid;
+        u64 sample_regs_intr;
+        u32 aux_watermark;
+        u16 sample_max_stack, reserved;
+        u32 aux_sample_size, reserved3;
+        u64 sig_data, config3;
+    } a;
+    memset(&a, 0, sizeof a);
+    a.type = 0;    // PERF_TYPE_HARDWARE
+    a.size = 128;  // PERF_ATTR_SIZE_VER7 or so; kernel accepts smaller known sizes
+    a.config = 1;  // PERF_COUNT_HW_INSTRUCTIONS
+    // flags: disabled=0, inherit=bit1, exclude_kernel=bit5, exclude_hv=bit6
+    a.flags = (1ULL << 1) | (1ULL << 5) | (1ULL << 6);
+    PERF_FD = (int)syscall(298 /* perf_event_open */, &a, 0, -1, -1, 0);
+}
+static u64 perf_read() {
+    u64 v = 0;
+    if (PERF_FD >= 0 && read(PERF_FD, &v, 8) != 8) v = 0;
+    return v;
+}
 static void mark(const char* what) {
     if (!TIMING) return;
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     double us = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, sy = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
-    fprintf(stderr, "%8.1f ms  user %7.1f  sys %7.1f  faults %ld  %s\n", (now_s() - T0) * 1000, us * 1000,
-            sy * 1000, ru.ru_minflt, what);
+    fprintf(stderr, "%8.1f ms  user %7.1f  sys %7.1f  Minstr %8.1f  %s\n", (now_s() - T0) * 1000, us * 1000,
+            sy * 1000, perf_read() / 1e6, what);
 }
 
 // ---------------------------------------------------------------- threads
@@ -296,11 +326,15 @@ static inline i64 parse_ts_fast(const char* s, size_t n) {
         const u64 SEPA = ((u64)'-' << 32) | ((u64)'-' << 56), SEPB = ((u64)'T' << 16) | ((u64)':' << 40);
         if ((a & ~DIG_A) == SEPA && (b & ~DIG_B) == SEPB && swar_digits(a, DIG_A) && swar_digits(b, DIG_B) &&
             s[16] == ':' && dig(s[17]) && dig(s[18])) {
-            int mo = d2(s + 5), d = d2(s + 8);
+            // all date/time digit pairs at once: byte i of t = 10*digit_i + digit_{i+1}
+            const u64 Z = 0x3030303030303030ULL;
+            u64 va = (a - (Z & DIG_A)) & DIG_A, vb = (b - (Z & DIG_B)) & DIG_B;
+            u64 ta = va * 10 + (va >> 8), tb = vb * 10 + (vb >> 8);
+            int mo = (int)((ta >> 40) & 0xFF), d = (int)(tb & 0xFF);
             int idx = mo * 32 + d;
-            i32 y = d2(s) * 100 + d2(s + 2);
+            i32 y = (i32)(ta & 0xFF) * 100 + (i32)((ta >> 16) & 0xFF);
             if (mo <= 12 && d <= 31 && DT_YEAR[idx] == y) {
-                int h = d2(s + 11), mi = d2(s + 14), se = d2(s + 17);
+                int h = (int)((tb >> 24) & 0xFF), mi = (int)((tb >> 48) & 0xFF), se = d2(s + 17);
                 if (h > 23 || mi > 59 || se > 59) return TS_BAD;
                 i64 off = 0;
                 if (n == 20) {
@@ -319,14 +353,22 @@ static inline i64 parse_ts_fast(const char* s, size_t n) {
             }
         }
     } else if (n >= 10 && n <= 16) {
-        // F3 fast path: all digits, no leading-zero subtleties needed (value fits easily)
-        i64 v = 0;
-        for (size_t i = 0; i < n; i++) {
-            unsigned c = (unsigned)(s[i] - '0');
-            if (c > 9) return TS_BAD;
-            v = v * 10 + c;
-        }
-        return v;
+        // F3 fast path: last 8 digits + first n-8 digits (left-padded with '0'), SWAR-parsed
+        const u64 Z = 0x3030303030303030ULL;
+        u64 lo, hi;
+        memcpy(&lo, s + n - 8, 8);
+        memcpy(&hi, s, 8);
+        unsigned pad = (unsigned)(16 - n) * 8;  // 0..48 bits of leading '0' bytes
+        hi = (hi << pad) | (Z & ((1ULL << pad) - 1));
+        if (!swar_digits(lo, ~0ULL) || !swar_digits(hi, ~0ULL)) return TS_BAD;
+        auto p8 = [](u64 x) -> u64 {
+            x -= 0x3030303030303030ULL;
+            x = ((x * 10) + (x >> 8)) & 0x00FF00FF00FF00FFULL;
+            x = ((x * 100) + (x >> 16)) & 0x0000FFFF0000FFFFULL;
+            x = ((x * 10000) + (x >> 32)) & 0x00000000FFFFFFFFULL;
+            return x;
+        };
+        return (i64)(p8(hi) * 100000000ULL + p8(lo));
     }
     return parse_ts(s, n);
 }
@@ -364,7 +406,35 @@ static inline u64 hash_bytes(const char* s, size_t n) {
     return mix64(h);
 }
 
+// SWAR + pext version of enc_key_ref. Reads up to 8 bytes past s+1 (buffers are padded).
 static inline u64 enc_key(const char* s, size_t n, bool& canon) {
+    if (n >= 1 && n <= 9 && (unsigned)(s[0] - 'a') < 26) {
+        u64 x;
+        memcpy(&x, s + 1, 8);
+        size_t r = n - 1;
+        u64 keep = r == 8 ? ~0ULL : ((1ULL << (8 * r)) - 1);
+        x &= keep;
+        const u64 H = 0x8080808080808080ULL, L = 0x0101010101010101ULL;
+        if (!(x & H)) {
+            u64 xh = x | H;
+            auto ge = [&](u64 c) { return (xh - L * c) & H; };  // high bit set where byte >= c
+            u64 isd = ge('0') & ~ge('9' + 1);
+            u64 isl = ge('a') & ~ge('z' + 1);
+            u64 isu = ge('_') & ~ge('_' + 1);
+            if (!(keep & H & ~(isd | isl | isu))) {
+                u64 dm = (isd >> 7) * 0xFF, lm = (isl >> 7) * 0xFF, um = (isu >> 7) * 0xFF;
+                u64 code = (((xh - L * 0x2F) & (L * 0x7F)) & dm) | (((xh - L * 0x55) & (L * 0x7F)) & lm) |
+                           ((L * 11) & um);
+                canon = true;
+                return ((u64)(s[0] - 'a' + 1) << 48) | _pext_u64(__builtin_bswap64(code), L * 0x3F);
+            }
+        }
+    }
+    canon = false;
+    return hash_bytes(s, n) | NONCANON;
+}
+
+static inline u64 enc_key_ref(const char* s, size_t n, bool& canon) {
     if (n >= 1 && n <= 9 && (unsigned)(s[0] - 'a') < 26) {
         u64 k = (u64)(s[0] - 'a' + 1) << 48;
         int sh = 42;
@@ -494,144 +564,121 @@ struct RTable {
 static inline int region_of(u64 key) { return (int)(mix64(key) >> 56); }
 
 // ---------------------------------------------------------------- CSV line scanning
-// Buffers always have >= 64 readable bytes past their logical end.
-struct Line {
-    const char* p;
-    u32 len;
-    u32 nc;          // number of commas
-    u32 commas[16];  // comma offsets (first min(nc,16))
-    u32 qw[8];       // quote bit mask words (lines up to 256 bytes)
-    u32 anyq;
+// Structural bitmasks for [b, b+N): bit i of word i/64 marks byte i. sep = ',' or '\n'.
+// A virtual newline is set at N. Requires 64 readable bytes past b+N.
+struct Masks {
+    std::vector<u64> nl, sep, q;
 };
-
-// Scans one line starting at p (ends at '\n' or lim). Returns false if longer than 256 bytes
-// (then only len is valid).
-static inline bool scan_line(const char* p, const char* lim, Line& L) {
+static void build_masks(const char* b, size_t N, Masks& M) {
+    size_t W = (N >> 6) + 1;
+    if (M.nl.size() < W + 1) {
+        M.nl.resize(W + 64);
+        M.sep.resize(W + 64);
+        M.q.resize(W + 64);
+    }
     const __m256i NL = _mm256_set1_epi8('\n'), CM = _mm256_set1_epi8(','), QT = _mm256_set1_epi8('"');
-    L.p = p;
-    L.nc = 0;
-    L.anyq = 0;
-    u32 off = 0;
-    while (true) {
-        __m256i v = _mm256_loadu_si256((const __m256i*)(p + off));
-        u32 nl = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, NL));
-        u32 cm = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, CM));
-        u32 q = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, QT));
-        if (p + off + 32 > lim) {
-            u32 rem = (u32)(lim - (p + off));
-            u32 m = rem >= 32 ? 0xFFFFFFFFu : ((1u << rem) - 1);
-            nl = (nl & m) | (rem < 32 ? (1u << rem) : 0);
-        }
-        u32 keep = 0xFFFFFFFFu;
-        if (nl) {
-            u32 k = __builtin_ctz(nl);
-            keep = k == 32 ? 0xFFFFFFFFu : ((1u << k) - 1);
-            cm &= keep;
-            q &= keep;
-            if (off < 256) {
-                L.qw[off >> 5] = q;
-                L.anyq |= q;
-                while (cm) {
-                    if (L.nc < 16) L.commas[L.nc] = off + __builtin_ctz(cm);
-                    L.nc++;
-                    cm &= cm - 1;
-                }
-            }
-            L.len = off + k;
-            return L.len <= 256 && off < 256;
-        }
-        if (off < 256) {
-            L.qw[off >> 5] = q;
-            L.anyq |= q;
-            while (cm) {
-                if (L.nc < 16) L.commas[L.nc] = off + __builtin_ctz(cm);
-                L.nc++;
-                cm &= cm - 1;
-            }
-        }
-        off += 32;
-        if (off >= 4096) {
-            // very long line: find its end with memchr
-            const char* nlp = (const char*)memchr(p + off, '\n', lim - (p + off));
-            L.len = (u32)((nlp ? nlp : lim) - p);
-            return false;
-        }
+    u64* nl = M.nl.data();
+    u64* sep = M.sep.data();
+    u64* q = M.q.data();
+    for (size_t w = 0; w < W; w++) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i*)(b + (w << 6)));
+        __m256i v1 = _mm256_loadu_si256((const __m256i*)(b + (w << 6) + 32));
+        u64 n = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, NL)) |
+                ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, NL)) << 32);
+        u64 c = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, CM)) |
+                ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, CM)) << 32);
+        u64 qq = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, QT)) |
+                 ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, QT)) << 32);
+        nl[w] = n;
+        sep[w] = n | c;
+        q[w] = qq;
     }
+    u64 bit = 1ULL << (N & 63);
+    nl[N >> 6] |= bit;
+    sep[N >> 6] |= bit;
+    nl[W] = sep[W] = ~0ULL;  // guard
+    q[W] = 0;
 }
 
-static inline bool qbit(const Line& L, u32 x) { return (L.qw[x >> 5] >> (x & 31)) & 1; }
-
-// Field extraction per rules.md from a scanned line. Returns false if malformed.
-template <int NF>
-static inline bool fields(const Line& L, const char** fp, u32* fl) {
-    if (L.nc != NF - 1) return false;
-    u32 s = 0;
-    if (!L.anyq) {
-        for (int k = 0; k < NF; k++) {
-            u32 e = k < NF - 1 ? L.commas[k] : L.len;
-            fp[k] = L.p + s;
-            fl[k] = e - s;
-            s = e + 1;
-        }
-        return true;
-    }
-    u32 total = 0;
-    for (int w = 0; w < 8 && (u32)w * 32 < L.len + 1; w++) total += __builtin_popcount(L.qw[w]);
-    u32 expect = 0;
-    for (int k = 0; k < NF; k++) {
-        u32 e = k < NF - 1 ? L.commas[k] : L.len;
-        if (e > s && qbit(L, s)) {
-            if (e - s < 2 || !qbit(L, e - 1)) return false;
-            expect += 2;
-            fp[k] = L.p + s + 1;
-            fl[k] = e - s - 2;
-        } else {
-            fp[k] = L.p + s;
-            fl[k] = e - s;
-        }
-        s = e + 1;
-    }
-    return total == expect;
+static inline u32 range_pop(const u64* q, size_t a, size_t b) {  // popcount of bits [a, b)
+    if (a >= b) return 0;
+    size_t wa = a >> 6, wb = (b - 1) >> 6;
+    u64 lo = ~0ULL << (a & 63), hi = ~0ULL >> (63 - ((b - 1) & 63));
+    if (wa == wb) return (u32)__builtin_popcountll(q[wa] & lo & hi);
+    u32 c = (u32)__builtin_popcountll(q[wa] & lo) + (u32)__builtin_popcountll(q[wb] & hi);
+    for (size_t w = wa + 1; w < wb; w++) c += (u32)__builtin_popcountll(q[w]);
+    return c;
 }
+static inline bool bit_at(const u64* m, size_t i) { return (m[i >> 6] >> (i & 63)) & 1; }
 
-// Slow path for lines longer than 256 bytes.
-template <int NF>
-static inline bool split_slow(const char* b, const char* e, const char** fp, u32* fl) {
-    int k = 0;
-    const char* fs = b;
-    for (const char* p = b;; ++p) {
-        if (p == e || *p == ',') {
-            if (k >= NF) return false;
-            size_t len = p - fs;
-            if (len && *fs == '"') {
-                if (len < 2 || p[-1] != '"') return false;
-                fs++;
-                len -= 2;
-                if (len && memchr(fs, '"', len)) return false;
-            } else if (len && memchr(fs, '"', len)) {
-                return false;
-            }
-            fp[k] = fs;
-            fl[k] = (u32)len;
-            k++;
-            if (p == e) break;
-            fs = p + 1;
-        }
-    }
-    return k == NF;
-}
-
+// Calls fn(fp, fl) for every well-formed row (rules.md dialect) in [b, lim).
+static std::atomic<u64> DBG_LINES[8], DBG_BYTES[8];
 template <int NF, class F>
 static inline void for_rows(const char* b, const char* lim, F fn) {
-    Line L;
+    static thread_local Masks M;
+    size_t N = lim - b;
+    if (!N) return;
+    if (TIMING) DBG_BYTES[NF].fetch_add(N, std::memory_order_relaxed);
+    build_masks(b, N, M);
+    const u64* nl = M.nl.data();
+    const u64* sep = M.sep.data();
+    const u64* q = M.q.data();
     const char* fp[NF];
     u32 fl[NF];
-    const char* p = b;
-    while (p < lim) {
-        bool fast = scan_line(p, lim, L);
-        bool ok = fast ? fields<NF>(L, fp, fl) : split_slow<NF>(p, p + L.len, fp, fl);
-        if (ok) fn(fp, fl);
-        p += L.len + 1;
+    size_t ends[NF];
+    size_t w = 0;
+    u64 m = sep[0];
+    size_t pos = 0;
+    while (pos <= N) {
+        size_t ls = pos, lineEnd;
+        int k = 0;
+        while (true) {  // walk separator bits in order
+            while (!m) m = sep[++w];
+            u64 bit = m & (0 - m);
+            size_t idx = (w << 6) + (size_t)__builtin_ctzll(m);
+            m ^= bit;
+            if (nl[w] & bit) {
+                lineEnd = idx;
+                break;
+            }
+            if (k < NF) ends[k] = idx;
+            k++;
+        }
+        pos = lineEnd + 1;
+        if (TIMING) DBG_LINES[NF].fetch_add(1, std::memory_order_relaxed);
+        if (lineEnd == N && ls == N) break;  // nothing after the last newline
+        if (k != NF - 1) continue;           // wrong field count (an empty line has one field)
+        ends[NF - 1] = lineEnd;
+        u32 qc = range_pop(q, ls, lineEnd);
+        size_t s = ls;
+        if (!qc) {
+            for (int f = 0; f < NF; f++) {
+                fp[f] = b + s;
+                fl[f] = (u32)(ends[f] - s);
+                s = ends[f] + 1;
+            }
+            fn(fp, fl);
+            continue;
+        }
+        u32 expect = 0;
+        bool ok = true;
+        for (int f = 0; f < NF; f++) {
+            size_t e = ends[f];
+            if (e > s && bit_at(q, s)) {
+                if (e - s < 2 || !bit_at(q, e - 1)) {
+                    ok = false;
+                    break;
+                }
+                expect += 2;
+                fp[f] = b + s + 1;
+                fl[f] = (u32)(e - s - 2);
+            } else {
+                fp[f] = b + s;
+                fl[f] = (u32)(e - s);
+            }
+            s = e + 1;
+        }
+        if (ok && qc == expect) fn(fp, fl);
     }
 }
 
@@ -985,10 +1032,87 @@ static inline void sort_events(u64* a, size_t n, std::vector<u64>& tmp) {
     }
 }
 
+// ---------------------------------------------------------------- self-test (SS_SELFTEST=1)
+// Fuzzes the fast parsers against the reference ones.
+static int selftest(i64 WS) {
+    u64 rng = 0x12345678abcdefULL;
+    auto rnd = [&]() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+    };
+    std::vector<char> buf(64 + 64, 0);
+    const char* alpha = "abcdefghijklmnopqrstuvwxyz0123456789_ ABCZ\r\"-:.\x80\xff\t";
+    size_t na = strlen(alpha);
+    long bad = 0;
+    for (long it = 0; it < 4000000; it++) {
+        size_t n = rnd() % 12;
+        for (size_t i = 0; i < 64; i++) buf[i] = alpha[rnd() % na];  // garbage after the string too
+        if (rnd() % 2) buf[0] = 'a' + rnd() % 26;
+        if (rnd() % 2)
+            for (size_t i = 1; i < n; i++) buf[i] = "0123456789_abcdefghijklmnopqrstuvwxyz"[rnd() % 37];
+        bool c1, c2;
+        u64 k1 = enc_key(buf.data(), n, c1), k2 = enc_key_ref(buf.data(), n, c2);
+        if (k1 != k2 || c1 != c2) {
+            if (bad++ < 5) fprintf(stderr, "enc_key mismatch n=%zu '%.*s'\n", n, (int)n, buf.data());
+        }
+    }
+    char tmp[64];
+    for (long it = 0; it < 4000000; it++) {
+        i64 t = WS - 9 * DAYMS + (i64)(rnd() % (u64)(30 * DAYMS));
+        int form = rnd() % 3;
+        std::string s;
+        if (form == 2) {
+            snprintf(tmp, sizeof tmp, "%0*lld", (int)(13 + rnd() % 4), (long long)t);
+            s = tmp;
+        } else {
+            i64 tt = t - t % 1000;
+            int off = form == 1 ? (int)(rnd() % 1500) - 750 : 0;
+            i64 local = tt + (i64)off * 60000;
+            i64 days = local / DAYMS, rem = local % DAYMS;
+            i64 z = days + 719468, era = z / 146097, doe = z - era * 146097;
+            i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365, y = yoe + era * 400;
+            i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+            i64 d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9;
+            y += m <= 2;
+            snprintf(tmp, sizeof tmp, "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld", (long long)y, (long long)m,
+                     (long long)d, (long long)(rem / 3600000), (long long)(rem / 60000 % 60),
+                     (long long)(rem / 1000 % 60));
+            s = tmp;
+            if (form == 0)
+                s += 'Z';
+            else {
+                int ao = off < 0 ? -off : off;
+                snprintf(tmp, sizeof tmp, "%c%02d:%02d", off < 0 ? '-' : '+', ao / 60, ao % 60);
+                s += tmp;
+            }
+        }
+        int muts = rnd() % 4 == 0 ? 1 + rnd() % 2 : 0;
+        for (int k = 0; k < muts && !s.empty(); k++) {
+            size_t p = rnd() % s.size();
+            int kind = rnd() % 4;
+            if (kind == 0) s[p] = "0123456789Zz+-:T t.9"[rnd() % 20];
+            else if (kind == 1) s.erase(p, 1);
+            else if (kind == 2) s.insert(p, 1, "09:-"[rnd() % 4]);
+            else s[p] = (char)('0' + rnd() % 10);
+        }
+        memset(buf.data(), 'x', buf.size());
+        memcpy(buf.data() + 32, s.data(), s.size());
+        i64 a = parse_ts_fast(buf.data() + 32, s.size()), b = parse_ts(buf.data() + 32, s.size());
+        if (a != b) {
+            if (bad++ < 10) fprintf(stderr, "ts mismatch '%s' fast=%lld ref=%lld\n", s.c_str(), (long long)a, (long long)b);
+        }
+    }
+    fprintf(stderr, "selftest: %ld mismatches\n", bad);
+    return bad ? 1 : 0;
+}
+
 // ---------------------------------------------------------------- main
 int main() {
     T0 = now_s();
     TIMING = getenv("SS_TIMING") != nullptr;
+    if (TIMING) perf_init();
     init_ch();
     const char* ev;
     std::string DATA = (ev = getenv("DATA_DIR")) ? ev : "/data";
@@ -1019,6 +1143,7 @@ int main() {
     const i64 DAY0 = floordiv(WS, DAYMS);
     const int NDAYS = (int)(floordiv(WE - 1, DAYMS) - DAY0 + 1);
     build_date_table(DAY0 - 40, DAY0 + NDAYS + 40);
+    if (getenv("SS_SELFTEST")) _exit(selftest(WS));
 
     // ---- input files
     auto evNames = list_csv(DATA + "/events");
@@ -1227,6 +1352,8 @@ int main() {
         }
     }
     mark("parse");
+    if (TIMING)
+        for (int f : {2, 4, 7}) fprintf(stderr, "  for_rows<%d>: %llu lines, %llu MB\n", f, (unsigned long long)DBG_LINES[f].load(), (unsigned long long)(DBG_BYTES[f].load() >> 20));
 
     // ---- link table + union-find
     RTable LT;
@@ -1389,7 +1516,7 @@ int main() {
             static thread_local std::vector<u64> pkeys, E2, tmp;
             static thread_local std::vector<u32> evIdx, ckIdx, eoff, coff;
             static thread_local std::vector<C2> Cv;
-            static thread_local std::vector<u32> cnt, since;
+            static thread_local std::vector<u32> cnt, since, cstart, wp2;
             static thread_local std::vector<u64> catSum;
             struct Sess {
                 u32 start;
@@ -1460,7 +1587,7 @@ int main() {
                     });
             }
             // clicks of these persons
-            std::vector<u32> cstart(np + 1, 0);
+            cstart.assign(np + 1, 0);
             ckIdx.resize(nc);
             at = 0;
             for (int q = 0; q < NT; q++)
@@ -1480,7 +1607,8 @@ int main() {
             }
             Cv.resize(cstart[np]);
             {
-                std::vector<u32> wp(cstart.begin(), cstart.end());
+                std::vector<u32>& wp = wp2;
+                wp.assign(cstart.begin(), cstart.end());
                 at = 0;
                 for (int q = 0; q < NT; q++)
                     ckShards[q][s].each([&](const CR& c) {
