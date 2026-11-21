@@ -142,9 +142,10 @@ static Arena ARENA;
 
 template <class T>
 struct BList {
-    struct Blk {
+    struct Blk {  // 64-byte header: items start cache-line aligned (arena allocations are 64-aligned)
         Blk* next;
         u32 n, cap;
+        char pad[48];
         T* items() { return (T*)(this + 1); }
     };
     Blk* head = nullptr;
@@ -153,6 +154,13 @@ struct BList {
     inline void push(const T& v, u32 bcap) {
         if (__builtin_expect(!cur || cur->n == cur->cap, 0)) grow(bcap);
         cur->items()[cur->n++] = v;
+    }
+    // reserves k contiguous slots (bcap must be a multiple of k for alignment to hold)
+    inline T* take(u32 k, u32 bcap) {
+        if (__builtin_expect(!cur || cur->n + k > cur->cap, 0)) grow(bcap);
+        T* p = cur->items() + cur->n;
+        cur->n += k;
+        return p;
     }
     void grow(u32 bcap) {
         Blk* b = (Blk*)ARENA.get(sizeof(Blk) + (size_t)bcap * sizeof(T));
@@ -503,6 +511,7 @@ struct HMap {
         shift = 64 - __builtin_ctzll(c);
     }
     inline size_t slot(u64 key) const { return (size_t)((key * 0x9E3779B97F4A7C15ULL) >> shift); }
+    inline void prefetch(u64 key) const { __builtin_prefetch(&s[slot(key)]); }
     inline u64* upsert(u64 key, u64 def, bool& inserted) {
         size_t i = slot(key);
         while (true) {
@@ -1221,9 +1230,17 @@ int main() {
     mark("metadata");
 
     // ---- parse links + events + clicks in one parallel pass
-    const int P = 512;   // event dedup partitions
+    // event dedup partitions: ~12k rows each, so a partition's hash table (2x slots, 16 B) is ~512 KB
+    int P = 256;
+    {
+        size_t evBytes = 0;
+        for (size_t f = 0; f < files.size(); f++)
+            if (kindOf[f] == 0) evBytes += files[f].n;
+        size_t estRows = evBytes / 70 + 1;
+        while (P < 4096 && (size_t)P * 12000 < estRows) P <<= 1;
+    }
     const int K = 1024;  // person shards
-    auto ppart = [](u64 k) { return (int)(mix64(k) & (P - 1)); };
+    auto ppart = [P](u64 k) { return (int)(mix64(k) & (u64)(P - 1)); };
     auto pshard = [](u64 k) { return (int)((mix64(k) >> 20) & (K - 1)); };
 
     std::vector<std::vector<BList<u64>>> lkKeys(NT, std::vector<BList<u64>>(256));
@@ -1243,7 +1260,12 @@ int main() {
             return (a.e - a.s) > (b.e - b.s);
         });
         const i64 WSs = WS / SEC;
-        run_tasks(chunks.size(), [&](int t, size_t ci) {
+        std::atomic<size_t> nextChunk{0};
+        parallel(NT, [&](int t) {
+        // per-partition staging (4 records = 128 B, cache-line aligned), flushed with streaming stores
+        ER* stage = (ER*)ARENA.get((size_t)P * 4 * sizeof(ER));
+        std::vector<u8> scnt(P, 0);
+        auto body = [&](size_t ci) {
             static thread_local std::vector<char> buf;
             const Chunk& c = chunks[ci];
             const char *lb, *le;
@@ -1325,7 +1347,18 @@ int main() {
                         r.ts = (u32)(ts - BASE);
                         r.packed = packed;
                     } while (0);
-                    parts[ppart(r.eid)].push(r, 256);
+                    int p = ppart(r.eid);
+                    ER* sb = stage + (size_t)p * 4;
+                    sb[scnt[p]] = r;
+                    if (++scnt[p] == 4) {
+                        scnt[p] = 0;
+                        __m256i* d = (__m256i*)parts[p].take(4, 256);
+                        const __m256i* src = (const __m256i*)sb;
+                        _mm256_stream_si256(d, _mm256_load_si256(src));
+                        _mm256_stream_si256(d + 1, _mm256_load_si256(src + 1));
+                        _mm256_stream_si256(d + 2, _mm256_load_si256(src + 2));
+                        _mm256_stream_si256(d + 3, _mm256_load_si256(src + 3));
+                    }
                 });
             } else {
                 auto& out = ckRaw[t];
@@ -1345,6 +1378,12 @@ int main() {
                     out.push({uk, cid, (u32)(ts - BASE), (u32)*cv}, 4096);
                 });
             }
+        };
+        size_t ci;
+        while ((ci = nextChunk.fetch_add(1, std::memory_order_relaxed)) < chunks.size()) body(ci);
+        for (int p = 0; p < P; p++)
+            for (int j = 0; j < scnt[p]; j++) evParts[t][p].push(stage[(size_t)p * 4 + j], 256);
+        _mm_sfence();
         });
         for (auto& r : regs) {
             for (auto& kv : r) REG.emplace(kv.first, kv.second);
@@ -1456,14 +1495,20 @@ int main() {
                 buf.clear();
                 buf.reserve(n);
                 for (int s = 0; s < NT; s++)
-                    evParts[s][p].each([&](const ER& r) {
-                        bool ins;
-                        u64* v = m.upsert(r.eid, buf.size(), ins);
-                        if (ins)
-                            buf.push_back(&r);
-                        else if (r.ing < buf[*v]->ing)
-                            buf[*v] = &r;
-                    });
+                    for (auto* b = evParts[s][p].head; b; b = b->next) {
+                        const ER* it = b->items();
+                        u32 nb = b->n;
+                        for (u32 i = 0; i < nb; i++) {
+                            if (i + 16 < nb) m.prefetch(it[i + 16].eid);
+                            const ER& r = it[i];
+                            bool ins;
+                            u64* v = m.upsert(r.eid, buf.size(), ins);
+                            if (ins)
+                                buf.push_back(&r);
+                            else if (r.ing < buf[*v]->ing)
+                                buf[*v] = &r;
+                        }
+                    }
                 surv.clear();
                 for (const ER* r : buf)
                     if (r->ts != TS_INVALID) surv.push_back(r);
@@ -1512,7 +1557,17 @@ int main() {
             cols[4].name = "revenue_cents", cols[4].type = P_INT64;
             cols[5].name = "top_category", cols[5].type = P_BYTES, cols[5].optional = true, cols[5].logical = 1;
         }
-        run_tasks(K, [&](int t, size_t s) {
+        // largest shards first, so a whale or shared-device person doesn't start last
+        std::vector<std::pair<size_t, int>> order(K);
+        for (int s = 0; s < K; s++) {
+            size_t n = 0;
+            for (int q = 0; q < NT; q++) n += evShards[q][s].size() + ckShards[q][s].size();
+            order[s] = {n, s};
+        }
+        std::sort(order.begin(), order.end(), std::greater<>());
+        if (TIMING) fprintf(stderr, "  largest shard %zu rows, median %zu\n", order[0].first, order[K / 2].first);
+        run_tasks(K, [&](int t, size_t oi) {
+            size_t s = (size_t)order[oi].second;
             static thread_local std::vector<u64> pkeys, E2, tmp;
             static thread_local std::vector<u32> evIdx, ckIdx, eoff, coff;
             static thread_local std::vector<C2> Cv;
