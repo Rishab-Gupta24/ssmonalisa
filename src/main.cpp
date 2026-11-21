@@ -395,6 +395,24 @@ __attribute__((always_inline)) static inline i64 parse_ts_fast(const char* s, si
     return parse_ts(s, n);
 }
 
+// ingest_ts is always valid F1 per rules.md. For the exact F1 shape (separators checked) the
+// digits are converted without per-digit validation; anything else takes the validating path.
+__attribute__((always_inline)) static inline i64 parse_ingest(const char* s, size_t n) {
+    if (n == 20 && s[4] == '-' && s[7] == '-' && s[10] == 'T' && s[13] == ':' && s[16] == ':' && s[19] == 'Z') {
+        __m128i dg = _mm_sub_epi8(_mm_loadu_si128((const __m128i*)s), _mm_set1_epi8('0'));
+        __m128i g = _mm_shuffle_epi8(dg, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+        __m128i p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+        u64 p0 = (u64)_mm_cvtsi128_si64(p);
+        u32 p1 = (u32)_mm_extract_epi32(p, 2);
+        unsigned mo = (unsigned)((p0 >> 32) & 0xFFFF), d = (unsigned)(p0 >> 48);
+        i32 y = (i32)(p0 & 0xFFFF) * 100 + (i32)((p0 >> 16) & 0xFFFF);
+        unsigned idx = mo * 32 + d;
+        if (mo <= 12 && d <= 31 && DT_YEAR[idx] == y)
+            return ((DT_DAYS[idx] * 24 + (i64)(p1 & 0xFFFF)) * 60 + (i64)(p1 >> 16)) * 60000 + d2(s + 17) * SEC;
+    }
+    return parse_ts_fast(s, n);
+}
+
 // ---------------------------------------------------------------- keys
 // Canonical strings ([a-z] then up to 8 of [0-9_a-z]) pack into 53 bits, order-preserving.
 // Everything else becomes a 63-bit hash with the top bit set and is kept in a registry.
@@ -1300,6 +1318,10 @@ static int selftest(i64 WS) {
         if (a != b) {
             if (bad++ < 10) fprintf(stderr, "ts mismatch '%s' fast=%lld ref=%lld\n", s.c_str(), (long long)a, (long long)b);
         }
+        // parse_ingest must agree on every valid timestamp (its input is always valid F1)
+        if (b != TS_BAD && parse_ingest(buf.data() + 32, s.size()) != b) {
+            if (bad++ < 10) fprintf(stderr, "ingest mismatch '%s'\n", s.c_str());
+        }
     }
     // CSV splitting: for_rows<NF> vs a direct reference implementation of the rules
     auto ref_split = [](const std::string& line, int NF, std::vector<std::string>& out) -> bool {
@@ -1576,8 +1598,10 @@ int main() {
         while (P < 4096 && (size_t)P * 12000 < estRows) P <<= 1;
     }
     const int K = 1024;  // person shards
-    auto ppart = [P](u64 k) { return (int)(mix64(k) & (u64)(P - 1)); };
-    auto pshard = [](u64 k) { return (int)((mix64(k) >> 20) & (K - 1)); };
+    // partition/shard = middle bits (20..) of k * golden; HMap slots use the top bits of the same product,
+    // so the two stay independent (sharing top bits once caused heavy clustering)
+    auto ppart = [P](u64 k) { return (int)(((k * 0x9E3779B97F4A7C15ULL) >> 20) & (u64)(P - 1)); };
+    auto pshard = [](u64 k) { return (int)(((k * 0x9E3779B97F4A7C15ULL) >> 20) & (K - 1)); };
 
     std::vector<std::vector<BList<u64>>> lkKeys(NT, std::vector<BList<u64>>(256));
     std::vector<BList<PK>> lkPairs(NT);
@@ -1634,7 +1658,7 @@ int main() {
                     bool cn;
                     r.eid = enc_key(fp[0], fl[0], cn);
                     r.pad = 0;
-                    i64 ing = parse_ts_fast(fp[3], fl[3]);
+                    i64 ing = parse_ingest(fp[3], fl[3]);
                     i64 ingS = ing == TS_BAD ? INT32_MAX : ing / SEC - WSs;
                     if (ingS > INT32_MAX) ingS = INT32_MAX;
                     if (ingS < INT32_MIN) ingS = INT32_MIN;
