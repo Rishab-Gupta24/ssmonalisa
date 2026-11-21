@@ -48,8 +48,9 @@ static void mark(const char* what) {
     if (!TIMING) return;
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
-    double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
-    fprintf(stderr, "%8.1f ms  cpu %7.1f ms  %s\n", (now_s() - T0) * 1000, cpu * 1000, what);
+    double us = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, sy = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+    fprintf(stderr, "%8.1f ms  user %7.1f  sys %7.1f  faults %ld  %s\n", (now_s() - T0) * 1000, us * 1000,
+            sy * 1000, ru.ru_minflt, what);
 }
 
 // ---------------------------------------------------------------- threads
@@ -76,18 +77,35 @@ struct Arena {
     char* base = nullptr;
     size_t cap = 0;
     std::atomic<size_t> off{0};
+    static const size_t HUGE = 2 << 20, SLAB = 4 << 20;
     void init(size_t c) {
-        cap = c;
-        void* p = mmap(nullptr, c, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        c = (c + HUGE - 1) & ~(HUGE - 1);
+        void* p = mmap(nullptr, c + HUGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (p == MAP_FAILED) die("arena mmap");
-        base = (char*)p;
+        base = (char*)(((uintptr_t)p + HUGE - 1) & ~(uintptr_t)(HUGE - 1));
+        cap = c;
         madvise(base, c, MADV_HUGEPAGE);
     }
-    void* get(size_t n) {
-        n = (n + 63) & ~(size_t)63;
+    // raw, globally shared bump allocation (fresh memory, zero-filled)
+    void* raw(size_t n, bool populate) {
+        n = (n + HUGE - 1) & ~(HUGE - 1);  // keeps every offset 2 MB aligned
         size_t o = off.fetch_add(n, std::memory_order_relaxed);
         if (o + n > cap) die("arena exhausted");
+        if (populate) madvise(base + o, n, 23 /* MADV_POPULATE_WRITE */);
         return base + o;
+    }
+    // per-thread slabs, prefaulted in one syscall each
+    void* get(size_t n) {
+        static thread_local char *sp = nullptr, *se = nullptr;
+        n = (n + 63) & ~(size_t)63;
+        if (n > SLAB / 4) return raw(n, true);
+        if (!sp || sp + n > se) {
+            sp = (char*)raw(SLAB, true);
+            se = sp + SLAB;
+        }
+        void* r = sp;
+        sp += n;
+        return r;
     }
 };
 static Arena ARENA;
@@ -132,6 +150,7 @@ struct BList {
 struct InFile {
     int fd = -1;
     size_t n = 0;
+    const char* map = nullptr;  // whole-file read-only mapping (zero-copy path)
 };
 
 static std::vector<std::string> list_csv(const std::string& dir) {
@@ -158,6 +177,10 @@ static InFile open_in(const std::string& path) {
     if (f.fd < 0) return f;
     struct stat st;
     if (fstat(f.fd, &st) == 0) f.n = st.st_size;
+    if (f.n > (1u << 20)) {
+        void* p = mmap(nullptr, f.n, PROT_READ, MAP_PRIVATE, f.fd, 0);
+        if (p != MAP_FAILED) f.map = (const char*)p;
+    }
     return f;
 }
 
@@ -557,6 +580,20 @@ static bool load_chunk(const InFile& f, size_t s, size_t e, std::vector<char>& b
                        const char*& le) {
     const size_t EXTRA = 1 << 16;
     size_t rs = s == 0 ? 0 : s - 1;
+    if (f.map && e + EXTRA < f.n) {
+        // zero-copy: every line we touch, plus 64 bytes of SIMD over-read, lies inside the file
+        const char* b = f.map;
+        const char* nl0 = (const char*)memchr(b + rs, '\n', f.n - rs);
+        if (!nl0) return false;
+        const char* start = nl0 + 1;
+        if ((size_t)(start - b) >= e) return false;
+        const char* endnl = (const char*)memchr(b + e - 1, '\n', f.n - (e - 1));
+        if (endnl && (size_t)(endnl - b) + 64 < f.n) {
+            lb = start;
+            le = endnl;
+            return true;
+        }
+    }
     size_t re = std::min(f.n, e + EXTRA);
     while (true) {
         size_t need = re - rs + 64;
@@ -990,7 +1027,6 @@ int main() {
     std::vector<std::vector<BList<ER>>> evParts(NT, std::vector<BList<ER>>(P));
     std::vector<BList<CK>> ckRaw(NT);
     std::vector<std::vector<std::pair<u64, std::string_view>>> regs(NT);
-    std::vector<std::vector<std::vector<char>>> keep(NT);
     {
         std::vector<Chunk> chunks;
         size_t target = std::max<size_t>(1 << 20, std::min<size_t>(8 << 20, totalBytes / (NT * 12) + 1));
@@ -1009,7 +1045,11 @@ int main() {
             const char *lb, *le;
             if (!load_chunk(files[c.file], c.s, c.e, buf, lb, le)) return;
             auto& rg = regs[t];
-            bool usedReg = false;
+            auto save = [&](u64 k, const char* p, u32 n) {
+                char* d = (char*)ARENA.get(n + 1);
+                memcpy(d, p, n);
+                rg.push_back({k, std::string_view(d, n)});
+            };
             if (c.kind == 2) {
                 auto& keys = lkKeys[t];
                 auto& pairs = lkPairs[t];
@@ -1017,8 +1057,8 @@ int main() {
                     if (!fl[0] || !fl[1]) return;
                     bool ca, cb;
                     u64 ka = enc_key(fp[0], fl[0], ca), kb = enc_key(fp[1], fl[1], cb);
-                    if (!ca) rg.push_back({ka, std::string_view(fp[0], fl[0])}), usedReg = true;
-                    if (!cb) rg.push_back({kb, std::string_view(fp[1], fl[1])}), usedReg = true;
+                    if (!ca) save(ka, fp[0], fl[0]);
+                    if (!cb) save(kb, fp[1], fl[1]);
                     if (ka == kb) return;
                     keys[region_of(ka)].push(ka, 512);
                     keys[region_of(kb)].push(kb, 512);
@@ -1077,7 +1117,7 @@ int main() {
                             packed = price | (cat << 24);
                         }
                         r.ukey = enc_key(fp[1], fl[1], cn);
-                        if (!cn) rg.push_back({r.ukey, std::string_view(fp[1], fl[1])}), usedReg = true;
+                        if (!cn) save(r.ukey, fp[1], fl[1]);
                         r.ts = (u32)(ts - BASE);
                         r.packed = packed;
                     } while (0);
@@ -1095,16 +1135,11 @@ int main() {
                     if (!cv) return;
                     if (!cn && campIds[*cv] != std::string_view(fp[2], fl[2])) return;
                     u64 uk = enc_key(fp[1], fl[1], cn);
-                    if (!cn) rg.push_back({uk, std::string_view(fp[1], fl[1])}), usedReg = true;
+                    if (!cn) save(uk, fp[1], fl[1]);
                     u64 cid = enc_key(fp[0], fl[0], cn);
-                    if (!cn) rg.push_back({cid, std::string_view(fp[0], fl[0])}), usedReg = true;
+                    if (!cn) save(cid, fp[0], fl[0]);
                     out.push({uk, cid, (u32)(ts - BASE), (u32)*cv}, 4096);
                 });
-            }
-            if (usedReg) {
-                // registry string_views point into buf: keep this buffer alive
-                keep[t].push_back(std::move(buf));
-                buf = std::vector<char>();
             }
         });
         for (auto& r : regs) {
@@ -1534,5 +1569,11 @@ int main() {
     }
     for (auto& w : writers) w.join();
     mark("done");
+    if (TIMING) {
+        std::string sm = read_small("/proc/self/smaps_rollup");
+        size_t p = sm.find("AnonHugePages");
+        if (p != std::string::npos) fprintf(stderr, "%s\n", sm.substr(p, sm.find('\n', p) - p).c_str());
+        fprintf(stderr, "arena used %zu MB\n", ARENA.off.load() >> 20);
+    }
     _exit(0);
 }
