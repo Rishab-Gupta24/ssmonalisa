@@ -257,6 +257,80 @@ static inline i64 parse_ts(const char* s, size_t n) {
     return v;
 }
 
+// Dates near the window, keyed by month*32+day: valid calendar dates only.
+static i32 DT_YEAR[13 * 32];
+static i64 DT_DAYS[13 * 32];
+static void build_date_table(i64 firstDay, i64 lastDay) {
+    for (int i = 0; i < 13 * 32; i++) DT_YEAR[i] = -1;
+    for (i64 d = firstDay; d <= lastDay; d++) {
+        // civil_from_days (Howard Hinnant)
+        i64 z = d + 719468;
+        i64 era = (z >= 0 ? z : z - 146096) / 146097;
+        i64 doe = z - era * 146097;
+        i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        i64 y = yoe + era * 400;
+        i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        i64 mp = (5 * doy + 2) / 153;
+        i64 dd = doy - (153 * mp + 2) / 5 + 1;
+        i64 m = mp < 10 ? mp + 3 : mp - 9;
+        y += m <= 2;
+        DT_YEAR[m * 32 + dd] = (i32)y;
+        DT_DAYS[m * 32 + dd] = d;
+    }
+}
+
+static const u64 DIG_A = 0x00FFFF00FFFFFFFFULL;  // "YYYY-MM-": digit bytes
+static const u64 DIG_B = 0xFFFF00FFFF00FFFFULL;  // "DDTHH:MM"
+static inline bool swar_digits(u64 x, u64 m) {
+    const u64 H = 0xF0F0F0F0F0F0F0F0ULL, T = 0x3030303030303030ULL, S = 0x0606060606060606ULL;
+    x &= m;
+    return (x & H & m) == (T & m) && (((x + (S & m)) & H & m) == (T & m));
+}
+
+// Same result as parse_ts, faster for F1/F2 dates near the window.
+static inline i64 parse_ts_fast(const char* s, size_t n) {
+    if (n == 20 || n == 25) {
+        u64 a, b;
+        memcpy(&a, s, 8);
+        memcpy(&b, s + 8, 8);
+        const u64 SEPA = ((u64)'-' << 32) | ((u64)'-' << 56), SEPB = ((u64)'T' << 16) | ((u64)':' << 40);
+        if ((a & ~DIG_A) == SEPA && (b & ~DIG_B) == SEPB && swar_digits(a, DIG_A) && swar_digits(b, DIG_B) &&
+            s[16] == ':' && dig(s[17]) && dig(s[18])) {
+            int mo = d2(s + 5), d = d2(s + 8);
+            int idx = mo * 32 + d;
+            i32 y = d2(s) * 100 + d2(s + 2);
+            if (mo <= 12 && d <= 31 && DT_YEAR[idx] == y) {
+                int h = d2(s + 11), mi = d2(s + 14), se = d2(s + 17);
+                if (h > 23 || mi > 59 || se > 59) return TS_BAD;
+                i64 off = 0;
+                if (n == 20) {
+                    if (s[19] != 'Z') return TS_BAD;
+                } else {
+                    char sg = s[19];
+                    if ((sg != '+' && sg != '-') || !dig(s[20]) || !dig(s[21]) || s[22] != ':' || !dig(s[23]) ||
+                        !dig(s[24]))
+                        return TS_BAD;
+                    int oh = d2(s + 20), om = d2(s + 23);
+                    if (oh > 23 || om > 59) return TS_BAD;
+                    off = (i64)(oh * 60 + om) * 60000;
+                    if (sg == '-') off = -off;
+                }
+                return ((DT_DAYS[idx] * 24 + h) * 60 + mi) * 60000 + se * SEC - off;
+            }
+        }
+    } else if (n >= 10 && n <= 16) {
+        // F3 fast path: all digits, no leading-zero subtleties needed (value fits easily)
+        i64 v = 0;
+        for (size_t i = 0; i < n; i++) {
+            unsigned c = (unsigned)(s[i] - '0');
+            if (c > 9) return TS_BAD;
+            v = v * 10 + c;
+        }
+        return v;
+    }
+    return parse_ts(s, n);
+}
+
 // ---------------------------------------------------------------- keys
 // Canonical strings ([a-z] then up to 8 of [0-9_a-z]) pack into 53 bits, order-preserving.
 // Everything else becomes a 63-bit hash with the top bit set and is kept in a registry.
@@ -341,44 +415,48 @@ static inline bool key_less(u64 a, u64 b) {
 
 // ---------------------------------------------------------------- hash map u64 -> u64 (key 0 = empty)
 struct HMap {
-    std::vector<u64> k, v;
+    struct KV {
+        u64 k, v;
+    };
+    std::vector<KV> s;
     u64 mask = 0;
     int shift = 64;
+    size_t cap() const { return s.size(); }
     void init(size_t n) {
-        size_t cap = 16;
-        while (cap < n * 2) cap <<= 1;
-        if (k.size() == cap) {
-            std::fill(k.begin(), k.end(), 0);
-        } else {
-            k.assign(cap, 0);
-            v.assign(cap, 0);
-        }
-        mask = cap - 1;
-        shift = 64 - __builtin_ctzll(cap);
+        size_t c = 16;
+        while (c < n * 2) c <<= 1;
+        if (s.size() == c)
+            memset((void*)s.data(), 0, c * sizeof(KV));
+        else
+            s.assign(c, KV{0, 0});
+        mask = c - 1;
+        shift = 64 - __builtin_ctzll(c);
     }
     inline size_t slot(u64 key) const { return (size_t)((key * 0x9E3779B97F4A7C15ULL) >> shift); }
     inline u64* upsert(u64 key, u64 def, bool& inserted) {
         size_t i = slot(key);
         while (true) {
-            if (k[i] == key) {
+            KV& e = s[i];
+            if (e.k == key) {
                 inserted = false;
-                return &v[i];
+                return &e.v;
             }
-            if (k[i] == 0) {
-                k[i] = key;
-                v[i] = def;
+            if (e.k == 0) {
+                e.k = key;
+                e.v = def;
                 inserted = true;
-                return &v[i];
+                return &e.v;
             }
             i = (i + 1) & mask;
         }
     }
     inline const u64* find(u64 key) const {
-        if (k.empty()) return nullptr;
+        if (s.empty()) return nullptr;
         size_t i = slot(key);
         while (true) {
-            if (k[i] == key) return &v[i];
-            if (k[i] == 0) return nullptr;
+            const KV& e = s[i];
+            if (e.k == key) return &e.v;
+            if (e.k == 0) return nullptr;
             i = (i + 1) & mask;
         }
     }
@@ -940,6 +1018,7 @@ int main() {
     auto floordiv = [](i64 a, i64 b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
     const i64 DAY0 = floordiv(WS, DAYMS);
     const int NDAYS = (int)(floordiv(WE - 1, DAYMS) - DAY0 + 1);
+    build_date_table(DAY0 - 40, DAY0 + NDAYS + 40);
 
     // ---- input files
     auto evNames = list_csv(DATA + "/events");
@@ -1072,7 +1151,7 @@ int main() {
                     bool cn;
                     r.eid = enc_key(fp[0], fl[0], cn);
                     r.pad = 0;
-                    i64 ing = parse_ts(fp[3], fl[3]);
+                    i64 ing = parse_ts_fast(fp[3], fl[3]);
                     i64 ingS = ing == TS_BAD ? INT32_MAX : ing / SEC - WSs;
                     if (ingS > INT32_MAX) ingS = INT32_MAX;
                     if (ingS < INT32_MIN) ingS = INT32_MIN;
@@ -1082,7 +1161,7 @@ int main() {
                     r.packed = 0;
                     do {
                         if (!fl[1] || !fl[5]) break;
-                        i64 ts = parse_ts(fp[2], fl[2]);
+                        i64 ts = parse_ts_fast(fp[2], fl[2]);
                         if (ts == TS_BAD || ts < WS || ts >= WE) break;
                         if (ing == TS_BAD || ing - ts > DAYMS) break;
                         const char* ty = fp[4];
@@ -1127,7 +1206,7 @@ int main() {
                 auto& out = ckRaw[t];
                 for_rows<4>(lb, le, [&](const char** fp, const u32* fl) {
                     if (!fl[0] || !fl[1] || !fl[2]) return;
-                    i64 ts = parse_ts(fp[3], fl[3]);
+                    i64 ts = parse_ts_fast(fp[3], fl[3]);
                     if (ts == TS_BAD || ts < WS - WEEK || ts >= WE) return;
                     bool cn;
                     u64 ck = enc_key(fp[2], fl[2], cn);
@@ -1241,8 +1320,7 @@ int main() {
         const int PD = 16;
         run_tasks(P + ckBlocks.size(), [&](int t, size_t task) {
             static thread_local HMap m;
-            static thread_local std::vector<ER> buf;
-            static thread_local std::vector<u32> surv;
+            static thread_local std::vector<const ER*> buf, surv;
             if (task < (size_t)P) {
                 int p = (int)task;
                 size_t n = 0;
@@ -1255,18 +1333,18 @@ int main() {
                         bool ins;
                         u64* v = m.upsert(r.eid, buf.size(), ins);
                         if (ins)
-                            buf.push_back(r);
-                        else if (r.ing < buf[*v].ing)
-                            buf[*v] = r;
+                            buf.push_back(&r);
+                        else if (r.ing < buf[*v]->ing)
+                            buf[*v] = &r;
                     });
                 surv.clear();
-                for (u32 i = 0; i < buf.size(); i++)
-                    if (buf[i].ts != TS_INVALID) surv.push_back(i);
+                for (const ER* r : buf)
+                    if (r->ts != TS_INVALID) surv.push_back(r);
                 auto& out = evShards[t];
                 size_t ns = surv.size();
                 for (size_t i = 0; i < ns; i++) {
-                    if (i + PD < ns) LT.prefetch(buf[surv[i + PD]].ukey);
-                    const ER& r = buf[surv[i]];
+                    if (i + PD < ns) LT.prefetch(surv[i + PD]->ukey);
+                    const ER& r = *surv[i];
                     const Slot* sl = LT.find(r.ukey);
                     u64 pk = sl ? sl->v : r.ukey;
                     out[pshard(pk)].push({pk, r.ts, r.packed}, 256);
@@ -1348,7 +1426,7 @@ int main() {
                     if (ins) {
                         pkeys.push_back(e.pkey);
                         eoff.push_back(0);
-                        if (pkeys.size() * 2 > pm.k.size()) {  // grow: rehash all persons
+                        if (pkeys.size() * 2 > pm.cap()) {  // grow: rehash all persons
                             pm.init(pkeys.size() * 2);
                             for (size_t i = 0; i < pkeys.size(); i++) {
                                 bool in2;
