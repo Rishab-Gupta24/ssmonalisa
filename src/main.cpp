@@ -539,17 +539,30 @@ struct HMap {
     struct KV {
         u64 k, v;
     };
-    std::vector<KV> s;
+    std::vector<KV> store;
+    KV* s = nullptr;
+    size_t capn = 0;
     u64 mask = 0;
     int shift = 64;
-    size_t cap() const { return s.size(); }
+    size_t cap() const { return capn; }
     void init(size_t n) {
         size_t c = 16;
         while (c < n * 2) c <<= 1;
-        if (s.size() == c)
-            memset((void*)s.data(), 0, c * sizeof(KV));
+        if (store.size() == c)
+            memset((void*)store.data(), 0, c * sizeof(KV));
         else
-            s.assign(c, KV{0, 0});
+            store.assign(c, KV{0, 0});
+        s = store.data();
+        capn = c;
+        mask = c - 1;
+        shift = 64 - __builtin_ctzll(c);
+    }
+    // one-shot table in fresh, prefaulted arena memory (no page-fault storm, no memset)
+    void init_arena(size_t n) {
+        size_t c = 16;
+        while (c < n * 2) c <<= 1;
+        s = (KV*)ARENA.raw(c * sizeof(KV), true);
+        capn = c;
         mask = c - 1;
         shift = 64 - __builtin_ctzll(c);
     }
@@ -573,7 +586,7 @@ struct HMap {
         }
     }
     inline const u64* find(u64 key) const {
-        if (s.empty()) return nullptr;
+        if (!s) return nullptr;
         size_t i = slot(key);
         while (true) {
             const KV& e = s[i];
@@ -598,7 +611,7 @@ struct RTable {
         bits = 16;
         while (((size_t)1 << bits) < n) bits++;
         size_t size = (size_t)1 << bits;
-        s = (Slot*)ARENA.get(size * sizeof(Slot));  // arena memory is fresh, hence zero
+        s = (Slot*)ARENA.raw(size * sizeof(Slot), false);  // fresh, hence zero; regions prefault in parallel
         rmask = (size >> 8) - 1;
     }
     inline size_t start(u64 key) const { return (size_t)(mix64(key) >> (64 - bits)); }
@@ -1416,32 +1429,52 @@ int main() {
     for (auto& f : files) totalBytes += f.n;
     ARENA.init(totalBytes * 2 + ((size_t)1 << 30));
 
+    mark("  input files + arena");
     // ---- products / categories
     std::vector<std::string> cats;
     HMap prodMap;
     {
         std::string prodText = read_small(DATA + "/products.csv");
-        std::unordered_map<std::string_view, int> catIdx;
-        std::vector<std::string_view> catViews;
-        prodMap.init(std::max<size_t>(1024, prodText.size() / 8));
+        std::vector<std::string_view> catViews;  // few categories: linear search with a last-hit cache
+        size_t lines = 0;
+        for (const char* p = prodText.data(); (p = (const char*)memchr(p, '\n', prodText.data() + prodText.size() - p));
+             p++)
+            lines++;
+        prodMap.init_arena(lines + 16);
         std::string buf = prodText;
         buf.append(64, '\0');
         const char* nl = (const char*)memchr(buf.data(), '\n', prodText.size());
+        int lastCat = -1;
+        HMap catHash;
+        catHash.init(1024);
         if (nl)
             for_rows<2>(nl + 1, buf.data() + prodText.size(), [&](const char** fp, const u32* fl) {
                 if (!fl[0]) return;
                 std::string_view c(fp[1], fl[1]);
-                auto it = catIdx.find(c);
+                // category index via a small hash table (hash of the bytes, verified by string compare)
+                u64 h = hash_bytes(c.data(), c.size()) | 1;
+                bool ins;
+                u64* slot = catHash.upsert(h, 0, ins);
                 int ci;
-                if (it == catIdx.end()) {
-                    ci = (int)cats.size();
-                    catIdx.emplace(c, ci);
-                    cats.emplace_back(c);
-                } else
-                    ci = it->second;
+                if (!ins && catViews[*slot] == c)
+                    ci = (int)*slot;
+                else {
+                    ci = -1;
+                    for (size_t j = 0; j < catViews.size(); j++)  // new category, or a hash collision
+                        if (catViews[j] == c) {
+                            ci = (int)j;
+                            break;
+                        }
+                    if (ci < 0) {
+                        ci = (int)cats.size();
+                        catViews.push_back(c);  // views into buf, alive for this block
+                        cats.emplace_back(c);
+                    }
+                    if (ins) *slot = (u64)ci;
+                }
+                (void)lastCat;
                 bool cn;
                 u64 k = enc_key(fp[0], fl[0], cn);
-                bool ins;
                 *prodMap.upsert(k, 0, ins) = ci;
             });
     }
@@ -1456,6 +1489,7 @@ int main() {
         for (size_t r = 0; r < ord.size(); r++) catRank[ord[r]] = (int)r;
     }
 
+    mark("  products");
     // ---- campaigns
     std::vector<std::string> campIds, campCh;
     HMap campMap;
@@ -1717,9 +1751,11 @@ int main() {
         for (int t = 0; t < NT; t++)
             for (int r = 0; r < 256; r++) upper += lkKeys[t][r].size();
         LT.init(std::max<size_t>(upper * 3 / 2, 1 << 16));
+        mark("  links: table alloc");
         std::vector<size_t> rcount(257, 0);
         size_t rsize = LT.rmask + 1;
         run_tasks(256, [&](int, size_t r) {
+            madvise((void*)(LT.s + r * rsize), rsize * sizeof(Slot), 23 /* MADV_POPULATE_WRITE */);
             size_t local = 0;
             for (int t = 0; t < NT; t++)
                 lkKeys[t][r].each([&](u64 k) {
@@ -1737,23 +1773,39 @@ int main() {
             if (local >= rsize) die("link region overflow");
             rcount[r] = local;
         });
+        mark("  links: region build");
         std::vector<size_t> rbase(257, 0);
         for (int r = 0; r < 256; r++) rbase[r + 1] = rbase[r] + rcount[r];
         size_t n = rbase[256];
-        std::vector<u64> keyOf(n);
+        // arena arrays (fresh, zero-filled), initialized in parallel
+        u64* keyOf = (u64*)ARENA.raw((n + 1) * sizeof(u64), false);
+        u32* parentRaw = (u32*)ARENA.raw((n + 1) * sizeof(u32), false);
+        u32* root = (u32*)ARENA.raw((n + 1) * sizeof(u32), false);
+        u64* minKey = (u64*)ARENA.raw((n + 1) * sizeof(u64), false);
         run_tasks(256, [&](int, size_t r) {
             Slot* s = LT.s + r * rsize;
             for (size_t i = 0; i < rsize; i++)
-                if (s[i].k) keyOf[rbase[r] + s[i].v] = s[i].k;
+                if (s[i].k) {
+                    size_t g = rbase[r] + s[i].v;
+                    keyOf[g] = s[i].k;
+                    parentRaw[g] = (u32)g;
+                }
         });
-        std::vector<std::atomic<u32>> parent(n);
-        for (size_t i = 0; i < n; i++) parent[i].store((u32)i, std::memory_order_relaxed);
+        struct PRef {  // relaxed atomic view over the parent array
+            u32* p;
+            u32 load(size_t i) const { return __atomic_load_n(&p[i], __ATOMIC_RELAXED); }
+            void store(size_t i, u32 v) const { __atomic_store_n(&p[i], v, __ATOMIC_RELAXED); }
+            bool cas(size_t i, u32 expect, u32 v) const {
+                return __atomic_compare_exchange_n(&p[i], &expect, v, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+            }
+        } parent{parentRaw};
+        mark("  links: keyOf+parent init");
         auto find = [&](u32 x) {
             while (true) {
-                u32 p = parent[x].load(std::memory_order_relaxed);
+                u32 p = parent.load(x);
                 if (p == x) return x;
-                u32 gp = parent[p].load(std::memory_order_relaxed);
-                if (gp != p) parent[x].store(gp, std::memory_order_relaxed);  // path halving (benign)
+                u32 gp = parent.load(p);
+                if (gp != p) parent.store(x, gp);  // path halving (benign)
                 x = gp;
             }
         };
@@ -1769,21 +1821,28 @@ int main() {
                     b = find(b);
                     if (a == b) break;
                     if (a < b) std::swap(a, b);  // link larger root under smaller
-                    u32 exp = a;
-                    if (parent[a].compare_exchange_strong(exp, b, std::memory_order_relaxed)) break;
+                    if (parent.cas(a, a, b)) break;
                 }
             });
         });
-        std::vector<u32> root(n);
+        mark("  links: unions");
         run_tasks(NT, [&](int, size_t t) {
             size_t lo = n * t / NT, hi = n * (t + 1) / NT;
             for (size_t i = lo; i < hi; i++) root[i] = find((u32)i);
         });
-        std::vector<u64> minKey(n, 0);
-        for (size_t i = 0; i < n; i++) {
-            u32 r = root[i];
-            if (minKey[r] == 0 || key_less(keyOf[i], minKey[r])) minKey[r] = keyOf[i];
-        }
+        mark("  links: roots");
+        // smallest ID per person: parallel atomic minimum under byte-wise order (keys are never 0)
+        run_tasks(NT, [&](int, size_t t) {
+            size_t lo = n * t / NT, hi = n * (t + 1) / NT;
+            for (size_t i = lo; i < hi; i++) {
+                u64 k = keyOf[i];
+                u64* slot = &minKey[root[i]];
+                u64 cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
+                while (cur == 0 || key_less(k, cur))
+                    if (__atomic_compare_exchange_n(slot, &cur, k, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
+            }
+        });
+        mark("  links: minKey");
         run_tasks(256, [&](int, size_t r) {
             Slot* s = LT.s + r * rsize;
             for (size_t i = 0; i < rsize; i++)
