@@ -758,22 +758,30 @@ static inline void for_rows(const char* b, const char* lim, F fn) {
                 clo &= mlo;
                 chi &= mhi;
                 if (__builtin_popcountll(clo) + __builtin_popcountll(chi) != NF - 1) continue;
+                // fields as if unquoted, filled while extracting the commas
                 int k = 0;
+                size_t s = ls;
                 while (clo) {
-                    ends[k++] = ls + (size_t)__builtin_ctzll(clo);
+                    size_t e = ls + (size_t)__builtin_ctzll(clo);
+                    ends[k] = e;
+                    fp[k] = b + s;
+                    fl[k] = (u32)(e - s);
+                    s = e + 1;
+                    k++;
                     clo &= clo - 1;
                 }
                 while (chi) {
-                    ends[k++] = ls + 64 + (size_t)__builtin_ctzll(chi);
+                    size_t e = ls + 64 + (size_t)__builtin_ctzll(chi);
+                    ends[k] = e;
+                    fp[k] = b + s;
+                    fl[k] = (u32)(e - s);
+                    s = e + 1;
+                    k++;
                     chi &= chi - 1;
                 }
                 ends[NF - 1] = ls + len;
-                size_t s = ls;
-                for (int f = 0; f < NF; f++) {
-                    fp[f] = b + s;
-                    fl[f] = (u32)(ends[f] - s);
-                    s = ends[f] + 1;
-                }
+                fp[NF - 1] = b + s;
+                fl[NF - 1] = (u32)(ls + len - s);
                 u64 qlo, qhi;
                 win(q, qlo, qhi);
                 qlo &= mlo;
