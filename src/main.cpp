@@ -523,7 +523,7 @@ static inline u64 enc_key_ref(const char* s, size_t n, bool& canon) {
     return hash_bytes(s, n) | NONCANON;
 }
 
-static std::unordered_map<u64, std::string_view> REG;  // noncanonical key -> string
+static std::unordered_map<u64, std::string> REG;  // noncanonical key -> string (owned: arena is freed early)
 
 static void key_append(u64 k, std::string& out) {
     if (k & NONCANON) {
@@ -1756,13 +1756,22 @@ int main() {
             u64 c0 = TIMING ? __rdtsc() : 0;
             body(ci);
             if (TIMING) CYCT[t][8 + chunks[ci].kind] += __rdtsc() - c0;
+            // drop this chunk's interior input pages from our page tables now (in parallel) instead of
+            // at exit; two pages are kept at each end for neighbours' lookahead (a re-touch just refaults)
+            const Chunk& c = chunks[ci];
+            const InFile& f = files[c.file];
+            if (f.map) {
+                size_t lo = ((c.s + 4095) & ~(size_t)4095) + 2 * 4096, hi = (c.e & ~(size_t)4095);
+                hi = hi > 2 * 4096 ? hi - 2 * 4096 : 0;
+                if (hi > lo) madvise((void*)(f.map + lo), hi - lo, MADV_DONTNEED);
+            }
         }
         for (int p = 0; p < P; p++)
             for (int j = 0; j < scnt[p]; j++) evParts[t][p].push(stage[(size_t)p * 4 + j], 256);
         _mm_sfence();
         });
         for (auto& r : regs) {
-            for (auto& kv : r) REG.emplace(kv.first, kv.second);
+            for (auto& kv : r) REG.emplace(kv.first, std::string(kv.second));
             r.clear();
         }
     }
@@ -1882,6 +1891,7 @@ int main() {
         });
     }
     mark("links");
+    const size_t arenaDeadEnd = ARENA.off.load();  // everything below is dead once dedup is done
 
     // ---- dedup events + resolve persons + scatter to person shards
     std::vector<std::vector<BList<EV>>> evShards(NT, std::vector<BList<EV>>(K));
@@ -1995,6 +2005,16 @@ int main() {
         fprintf(stderr, "    link table: 2^%d slots (%zu MB)\n", LT.bits, ((size_t)16 << LT.bits) >> 20);
     }
 
+    // release parse records, link structures and parse staging (dead now) in parallel, so the
+    // kernel does not free them single-threaded at exit
+    {
+        size_t end = arenaDeadEnd & ~(Arena::HUGE - 1);
+        run_tasks(NT, [&](int, size_t t) {
+            size_t lo = (end / NT * t) & ~(Arena::HUGE - 1), hi = t + 1 == (size_t)NT ? end : ((end / NT * (t + 1)) & ~(Arena::HUGE - 1));
+            if (hi > lo) madvise(ARENA.base + lo, hi - lo, MADV_DONTNEED);
+        });
+    }
+    mark("release dead memory");
     // ---- sessionize + attribute per shard
     const size_t CAMPW = (size_t)(NCAMP + 1) * NDAYS;
     std::vector<std::vector<u64>> camp(NT);
@@ -2287,6 +2307,14 @@ int main() {
         });
     }
     mark("sessionize");
+    {  // the rest of the arena (dedup output, staging) is dead too: release it in parallel, not at exit
+        size_t lo0 = arenaDeadEnd & ~(Arena::HUGE - 1), end = ARENA.off.load();
+        run_tasks(NT, [&](int, size_t t) {
+            size_t span = (end - lo0) / NT;
+            size_t lo = (lo0 + span * t) & ~(Arena::HUGE - 1), hi = t + 1 == (size_t)NT ? end : ((lo0 + span * (t + 1)) & ~(Arena::HUGE - 1));
+            if (hi > lo) madvise(ARENA.base + lo, hi - lo, MADV_DONTNEED);
+        });
+    }
     if (TIMING) {
         const char* nm[6] = {"ev gather+count", "ev scatter", "clicks", "sort", "sessions+rows", "attribution"};
         for (int k = 0; k < 6; k++) {
