@@ -226,7 +226,7 @@ static InFile open_in(const std::string& path) {
     if (f.fd < 0) return f;
     struct stat st;
     if (fstat(f.fd, &st) == 0) f.n = st.st_size;
-    if (f.n > (1u << 20)) {
+    if (f.n > 0) {  // every file is mapped: registry entries and click IDs point into the mapping
         void* p = mmap(nullptr, f.n, PROT_READ, MAP_PRIVATE, f.fd, 0);
         if (p != MAP_FAILED) f.map = (const char*)p;
     }
@@ -436,12 +436,22 @@ static inline u64 mix64(u64 k) {
     return k;
 }
 
+// 8 bytes per step (1 in 8 IDs is 33+ characters since scorer v5). The tail is a masked 8-byte
+// load: every caller hashes text inside a buffer with at least 8 readable bytes past the end.
 static inline u64 hash_bytes(const char* s, size_t n) {
     u64 h = 0x9E3779B97F4A7C15ULL ^ (n * 0xff51afd7ed558ccdULL);
-    for (size_t i = 0; i < n; i++) {
-        h ^= (u8)s[i];
-        h *= 0x100000001b3ULL;
-        h ^= h >> 29;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        u64 w;
+        memcpy(&w, s + i, 8);
+        h = (h ^ w) * 0x9FB21C651E98DF25ULL;
+        h ^= h >> 31;
+    }
+    if (i < n) {
+        u64 w;
+        memcpy(&w, s + i, 8);
+        h = (h ^ _bzhi_u64(w, (unsigned)(8 * (n - i)))) * 0x9FB21C651E98DF25ULL;
+        h ^= h >> 31;
     }
     return mix64(h);
 }
@@ -523,13 +533,12 @@ static inline u64 enc_key_ref(const char* s, size_t n, bool& canon) {
     return hash_bytes(s, n) | NONCANON;
 }
 
-static std::unordered_map<u64, std::string_view> REG;  // noncanonical key -> string
+static std::string_view reg_lookup(u64 k);  // noncanonical key -> its text (registry, defined below)
 
 static void key_append(u64 k, std::string& out) {
     if (k & NONCANON) {
-        auto it = REG.find(k);
-        if (it == REG.end()) die("unregistered key");
-        out.append(it->second.data(), it->second.size());
+        std::string_view sv = reg_lookup(k);
+        out.append(sv.data(), sv.size());
         return;
     }
     out.push_back((char)('a' + ((k >> 48) & 31) - 1));
@@ -539,17 +548,43 @@ static void key_append(u64 k, std::string& out) {
         out.push_back(DECH[c]);
     }
 }
-static std::string key_str(u64 k) {
-    std::string s;
-    key_append(k, s);
-    return s;
+// canonical key -> its text in buf (<= 9 chars)
+static inline std::string_view key_canon_view(u64 k, char* buf) {
+    size_t n = 0;
+    buf[n++] = (char)('a' + ((k >> 48) & 31) - 1);
+    for (int sh = 42; sh >= 0; sh -= 6) {
+        int c = (k >> sh) & 63;
+        if (!c) break;
+        buf[n++] = DECH[c];
+    }
+    return std::string_view(buf, n);
+}
+static inline std::string_view key_view(u64 k, char* buf) {
+    if (!(k & NONCANON)) return key_canon_view(k, buf);
+    return reg_lookup(k);
 }
 
-// byte-wise compare of the strings behind two keys
+// byte-wise compare of the strings behind two user/link keys (no allocation)
 static inline bool key_less(u64 a, u64 b) {
     if (!((a | b) & NONCANON)) return a < b;
     if (a == b) return false;
-    return key_str(a) < key_str(b);
+    char ba[16], bb[16];
+    return key_view(a, ba) < key_view(b, bb);
+}
+
+// Click IDs only need byte order (same-ts tie-breaks), never equality, so a long click ID is kept
+// as a tagged pointer to its text: bit 63 | length << 47 | address (user-space addresses < 2^47).
+static inline u64 cid_ptr_key(const char* p, size_t n) {
+    return NONCANON | ((u64)n << 47) | (u64)(uintptr_t)p;
+}
+static inline std::string_view cid_view(u64 k, char* buf) {
+    if (!(k & NONCANON)) return key_canon_view(k, buf);
+    return std::string_view((const char*)(uintptr_t)(k & ((1ULL << 47) - 1)), (size_t)((k >> 47) & 0xFFFF));
+}
+static inline bool cid_less(u64 a, u64 b) {
+    if (!((a | b) & NONCANON)) return a < b;
+    char ba[16], bb[16];
+    return cid_view(a, ba) < cid_view(b, bb);
 }
 
 // ---------------------------------------------------------------- hash map u64 -> u64 (key 0 = empty)
@@ -645,6 +680,14 @@ struct RTable {
     inline void prefetch(u64 key) const { __builtin_prefetch(&s[start(key)]); }
 };
 static inline int region_of(u64 key) { return (int)(mix64(key) >> 56); }
+
+// registry of noncanonical user/link IDs: key -> text, slot value = length << 47 | address
+static RTable REGT;
+static std::string_view reg_lookup(u64 k) {
+    const Slot* s = REGT.s ? REGT.find(k) : nullptr;
+    if (!s) die("unregistered key");
+    return std::string_view((const char*)(uintptr_t)(s->v & ((1ULL << 47) - 1)), (size_t)(s->v >> 47));
+}
 
 // ---------------------------------------------------------------- CSV line scanning
 // Structural bitmasks for [b, b+N): bit i of word i/64 marks byte i. sep = ',' or '\n'.
@@ -845,8 +888,10 @@ struct Chunk {
 };
 
 // Loads the lines of file f whose first byte lies in [s,e) into buf; sets [lb, le).
+// delta: add to a pointer into [lb, le) to get the same byte inside f.map (when f.map is set)
 static bool load_chunk(const InFile& f, size_t s, size_t e, std::vector<char>& buf, const char*& lb,
-                       const char*& le) {
+                       const char*& le, ptrdiff_t& delta) {
+    delta = 0;
     const size_t EXTRA = 1 << 16;
     size_t rs = s == 0 ? 0 : s - 1;
     if (f.map && e + EXTRA < f.n) {
@@ -873,6 +918,7 @@ static bool load_chunk(const InFile& f, size_t s, size_t e, std::vector<char>& b
         if (buf.size() < need) buf.resize(need + (need >> 3));
         pread_all(f.fd, buf.data(), re - rs, rs);
         memset(buf.data() + (re - rs), 0, 64);
+        delta = f.map ? (f.map + rs) - buf.data() : 0;
         const char* b = buf.data();
         const char* nl0 = (const char*)memchr(b, '\n', re - rs);
         if (!nl0) {
@@ -1556,7 +1602,8 @@ int main() {
     std::vector<BList<PK>> lkPairs(NT);
     std::vector<std::vector<BList<ER>>> evParts(NT, std::vector<BList<ER>>(P));
     std::vector<BList<CK>> ckRaw(NT);
-    std::vector<std::vector<std::pair<u64, std::string_view>>> regs(NT);
+    std::vector<std::vector<std::vector<std::pair<u64, std::string_view>>>> regs(
+        NT, std::vector<std::vector<std::pair<u64, std::string_view>>>(256));  // [thread][region]
     {
         std::vector<Chunk> chunks;
         size_t target = std::max<size_t>(1 << 20, std::min<size_t>(8 << 20, totalBytes / (NT * 12) + 1));
@@ -1575,16 +1622,37 @@ int main() {
         ER* stage = (ER*)ARENA.get((size_t)P * 8 * sizeof(ER));
         BList<EV> details;  // arena-backed entries remain valid through dedup
         std::vector<u8> scnt(P, 0);
+        HMap seen;  // noncanonical IDs this thread already registered
+        seen.init(1 << 14);
+        size_t seenCount = 0;
         auto body = [&](size_t ci) {
             static thread_local std::vector<char> buf;
             const Chunk& c = chunks[ci];
             const char *lb, *le;
-            if (!load_chunk(files[c.file], c.s, c.e, buf, lb, le)) return;
+            ptrdiff_t delta;
+            const bool mapped = files[c.file].map != nullptr;
+            if (!load_chunk(files[c.file], c.s, c.e, buf, lb, le, delta)) return;
             auto& rg = regs[t];
-            auto save = [&](u64 k, const char* p, u32 n) {
+            // stable text for a field: inside the file mapping, or (no mapping) an arena copy
+            auto stable = [&](const char* p, u32 n) -> const char* {
+                if (mapped) return p + delta;
                 char* d = (char*)ARENA.get(n + 1);
                 memcpy(d, p, n);
-                rg.push_back({k, std::string_view(d, n)});
+                return d;
+            };
+            // register a noncanonical user/link ID once per thread
+            auto save = [&](u64 k, const char* p, u32 n) {
+                bool ins;
+                seen.upsert(k, 1, ins);
+                if (!ins) return;
+                rg[region_of(k)].push_back({k, std::string_view(stable(p, n), n)});
+                if (++seenCount * 2 > seen.cap()) {  // grow
+                    HMap bigger;
+                    bigger.init(seen.cap());
+                    for (size_t i = 0; i < seen.cap(); i++)
+                        if (seen.s[i].k) bigger.upsert(seen.s[i].k, 1, ins);
+                    std::swap(seen, bigger);
+                }
             };
             if (c.kind == 2) {
                 auto& keys = lkKeys[t];
@@ -1688,7 +1756,7 @@ int main() {
                     u64 uk = enc_key(fp[1], fl[1], cn);
                     if (!cn) save(uk, fp[1], fl[1]);
                     u64 cid = enc_key(fp[0], fl[0], cn);
-                    if (!cn) save(cid, fp[0], fl[0]);
+                    if (!cn) cid = cid_ptr_key(stable(fp[0], fl[0]), fl[0]);  // order-only: no registry
                     out.push({uk, cid, (u32)(ts - BASE), (u32)*cv}, 4096);
                 });
             }
@@ -1703,9 +1771,26 @@ int main() {
             for (int j = 0; j < scnt[p]; j++) evParts[t][p].push(stage[(size_t)p * 8 + j], 256);
         _mm_sfence();
         });
-        for (auto& r : regs) {
-            for (auto& kv : r) REG.emplace(kv.first, kv.second);
-            r.clear();
+        mark("parse workers done");
+        {  // build the registry in parallel, one task per region (an ID registered by several threads is kept once)
+            size_t total = 0;
+            for (auto& rt : regs)
+                for (auto& r : rt) total += r.size();
+            REGT.init(std::max<size_t>(total * 3 / 2, 1 << 16));
+            size_t rsz = REGT.rmask + 1;
+            run_tasks(256, [&](int, size_t r) {
+                size_t used = 0;
+                for (int t = 0; t < NT; t++)
+                    for (auto& kv : regs[t][r]) {
+                        size_t i = REGT.start(kv.first);
+                        while (REGT.s[i].k && REGT.s[i].k != kv.first) i = REGT.next(i);
+                        if (!REGT.s[i].k) {
+                            if (++used >= rsz) die("registry region overflow");
+                            REGT.s[i].k = kv.first;
+                            REGT.s[i].v = ((u64)kv.second.size() << 47) | (u64)(uintptr_t)kv.second.data();
+                        }
+                    }
+            });
         }
     }
     mark("parse");
@@ -2205,7 +2290,7 @@ int main() {
                         size_t q = hi - 1, best = q;
                         while (q > lo && Cp[q - 1].ts == Cp[hi - 1].ts) {
                             q--;
-                            if (key_less(Cp[q].cid, Cp[best].cid)) best = q;
+                            if (cid_less(Cp[q].cid, Cp[best].cid)) best = q;
                         }
                         cc = Cp[best].camp;
                     }
