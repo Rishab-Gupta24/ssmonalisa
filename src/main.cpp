@@ -87,10 +87,18 @@ struct Arena {
         if (populate) madvise(base + o, n, 23 /* MADV_POPULATE_WRITE */);
         return base + o;
     }
+    // dead blocks this thread may reuse (already faulted in): avoids fresh pages for later allocations
+    static inline thread_local std::vector<char*> recycled;
+    static inline thread_local size_t recycledSize = 0;
     // per-thread slabs, prefaulted in one syscall each
     void* get(size_t n) {
         static thread_local char *sp = nullptr, *se = nullptr;
         n = (n + 63) & ~(size_t)63;
+        if (!recycled.empty() && n <= recycledSize) {
+            char* r = recycled.back();
+            recycled.pop_back();
+            return r;
+        }
         if (n > SLAB / 4) return raw(n, true);
         if (!sp || sp + n > se) {
             sp = (char*)raw(SLAB, true);
@@ -1745,7 +1753,6 @@ int main() {
 
     // (link table + union-find now run as stages inside the parse phase)
     mark("links");
-    const size_t arenaDeadEnd = ARENA.off.load();  // everything below is dead once dedup is done
 
     // ---- dedup events + resolve persons + scatter to person shards
     std::vector<std::vector<BList<EV>>> evShards(NT, std::vector<BList<EV>>(K));
@@ -1823,6 +1830,15 @@ int main() {
                     u64 pk = sl ? sl->v : r.ukey;
                     emit(pshard(pk), EV{pk, r.ts, r.packed});
                 }
+                // this partition's record blocks are dead: this thread reuses them (already faulted in)
+                // for its output blocks, which are smaller
+                Arena::recycledSize = sizeof(BList<ER>::Blk) + 256 * sizeof(ER);
+                for (int s = 0; s < NT; s++)
+                    for (auto* b = evParts[s][p].head; b;) {
+                        auto* nx = b->next;
+                        Arena::recycled.push_back((char*)b);
+                        b = nx;
+                    }
             } else {
                 auto* b = ckBlocks[task - P];
                 CK* it = b->items();
@@ -1846,16 +1862,6 @@ int main() {
     }
     mark("dedup+resolve");
 
-    // release parse records, link structures and parse staging (dead now) in parallel, so the
-    // kernel does not free them single-threaded at exit
-    {
-        size_t end = arenaDeadEnd & ~(Arena::HUGE - 1);
-        run_tasks(NT, [&](int, size_t t) {
-            size_t lo = (end / NT * t) & ~(Arena::HUGE - 1), hi = t + 1 == (size_t)NT ? end : ((end / NT * (t + 1)) & ~(Arena::HUGE - 1));
-            if (hi > lo) madvise(ARENA.base + lo, hi - lo, MADV_DONTNEED);
-        });
-    }
-    mark("release dead memory");
     // ---- sessionize + attribute per shard
     const size_t CAMPW = (size_t)(NCAMP + 1) * NDAYS;
     std::vector<std::vector<u64>> camp(NT);
@@ -2129,11 +2135,10 @@ int main() {
         });
     }
     mark("sessionize");
-    {  // the rest of the arena (dedup output, staging) is dead too: release it in parallel, not at exit
-        size_t lo0 = arenaDeadEnd & ~(Arena::HUGE - 1), end = ARENA.off.load();
+    {  // the whole arena is dead now: release it in parallel so the kernel does not free it at exit
+        size_t end = ARENA.off.load();
         run_tasks(NT, [&](int, size_t t) {
-            size_t span = (end - lo0) / NT;
-            size_t lo = (lo0 + span * t) & ~(Arena::HUGE - 1), hi = t + 1 == (size_t)NT ? end : ((lo0 + span * (t + 1)) & ~(Arena::HUGE - 1));
+            size_t lo = (end / NT * t) & ~(Arena::HUGE - 1), hi = t + 1 == (size_t)NT ? end : ((end / NT * (t + 1)) & ~(Arena::HUGE - 1));
             if (hi > lo) madvise(ARENA.base + lo, hi - lo, MADV_DONTNEED);
         });
     }
