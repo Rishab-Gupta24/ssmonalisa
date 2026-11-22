@@ -627,7 +627,7 @@ static inline u32 range_pop(const u64* q, size_t a, size_t b) {  // popcount of 
 
 // Calls fn(fp, fl) for every well-formed row (rules.md dialect) in [b, lim).
 template <int NF, class F>
-static inline void for_rows(const char* b, const char* lim, F fn) {
+static inline void for_rows_block(const char* b, const char* lim, F& fn) {
     static thread_local Masks M;
     size_t N = lim - b;
     if (!N) return;
@@ -792,6 +792,22 @@ static inline void for_rows(const char* b, const char* lim, F fn) {
         }
         if (!bad) fn(fp, fl);
     }
+}
+
+// Parses [b, lim) in ~16 KB tiles that end at a newline, so each tile's bytes and masks stay in
+// L1/L2 between mask building, line walking and field parsing. A longer line extends its tile.
+template <int NF, class F>
+static inline void for_rows(const char* b, const char* lim, F fn) {
+    constexpr size_t BLK = 16384;
+    const char* p = b;
+    while ((size_t)(lim - p) > BLK) {
+        const char* nl = (const char*)memrchr(p, '\n', BLK);
+        if (!nl) nl = (const char*)memchr(p + BLK, '\n', lim - (p + BLK));
+        if (!nl) break;
+        for_rows_block<NF>(p, nl, fn);  // the tile ends just before this '\n'
+        p = nl + 1;
+    }
+    for_rows_block<NF>(p, lim, fn);
 }
 
 // small clean files (products, campaigns)
@@ -1240,6 +1256,7 @@ static int selftest(i64 WS) {
     for (long it = 0; it < 300000; it++) {
         int NF = (rnd() % 2) ? 7 : 4;
         int nlines = 1 + rnd() % 6;
+        if (rnd() % 100 == 0) nlines = 700 + rnd() % 400;  // longer than one 16 KB parse tile
         std::string text;
         std::vector<std::string> lines;
         for (int l = 0; l < nlines; l++) {
