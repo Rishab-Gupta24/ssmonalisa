@@ -1890,7 +1890,7 @@ int main() {
         std::vector<typename BList<CK>::Blk*> ckBlocks;
         for (int t = 0; t < NT; t++)
             for (auto* b = ckRaw[t].head; b; b = b->next) ckBlocks.push_back(b);
-        const int PD = 16;
+        const int PD = 32;  // link-table prefetch distance
         std::atomic<size_t> nextTask{0};
         const size_t ntasks = P + ckBlocks.size();
         parallel(NT, [&](int t) {
@@ -1910,9 +1910,23 @@ int main() {
                 _mm256_stream_si256(d + 3, _mm256_load_si256(src + 3));
             }
         };
+        // clicks: staging of 8 CRs (192 B = 3 cache lines; block capacity 168 keeps flushes aligned)
+        CR* cstage = (CR*)ARENA.get((size_t)K * 8 * sizeof(CR));
+        std::vector<u8> ccnt(K, 0);
+        auto emitc = [&](int sh, const CR& c) {
+            CR* sb = cstage + (size_t)sh * 8;
+            sb[ccnt[sh]] = c;
+            if (++ccnt[sh] == 8) {
+                ccnt[sh] = 0;
+                __m256i* d = (__m256i*)ckShards[t][sh].take(8, 168);
+                const __m256i* src = (const __m256i*)sb;
+                for (int j = 0; j < 6; j++) _mm256_stream_si256(d + j, _mm256_load_si256(src + j));
+            }
+        };
         auto task_fn = [&](size_t task) {
             static thread_local HMap m;
             static thread_local std::vector<const ER*> buf, surv;
+            u64 d0 = TIMING ? __rdtsc() : 0;
             if (task < (size_t)P) {
                 int p = (int)task;
                 size_t n = 0;
@@ -1935,6 +1949,7 @@ int main() {
                                 buf[*v] = &r;
                         }
                     }
+                u64 d1 = TIMING ? __rdtsc() : 0;
                 surv.clear();
                 for (const ER* r : buf)
                     if (r->ts != TS_INVALID) surv.push_back(r);
@@ -1946,27 +1961,39 @@ int main() {
                     u64 pk = sl ? sl->v : r.ukey;
                     emit(pshard(pk), EV{pk, r.ts, r.packed});
                 }
+                if (TIMING) CYCT[t][10] += d1 - d0, CYCT[t][11] += __rdtsc() - d1;
             } else {
                 auto* b = ckBlocks[task - P];
                 CK* it = b->items();
                 u32 nb = b->n;
-                auto& out = ckShards[t];
                 for (u32 i = 0; i < nb; i++) {
                     if (i + PD < nb) LT.prefetch(it[i + PD].ukey);
                     const Slot* sl = LT.find(it[i].ukey);
                     u64 pk = sl ? sl->v : it[i].ukey;
-                    out[pshard(pk)].push({pk, it[i].cid, it[i].ts, it[i].camp}, 170);
+                    emitc(pshard(pk), CR{pk, it[i].cid, it[i].ts, it[i].camp});
                 }
+                if (TIMING) CYCT[t][12] += __rdtsc() - d0;
             }
         };
         size_t tk;
         while ((tk = nextTask.fetch_add(1, std::memory_order_relaxed)) < ntasks) task_fn(tk);
-        for (int sh = 0; sh < K; sh++)
+        for (int sh = 0; sh < K; sh++) {
             for (int j = 0; j < scnt[sh]; j++) evShards[t][sh].push(stage[(size_t)sh * 8 + j], 256);
+            for (int j = 0; j < ccnt[sh]; j++) ckShards[t][sh].push(cstage[(size_t)sh * 8 + j], 168);
+        }
         _mm_sfence();
         });
     }
     mark("dedup+resolve");
+    if (TIMING) {
+        const char* dn[3] = {"dedup map build", "survivors resolve+emit", "clicks resolve"};
+        for (int k = 0; k < 3; k++) {
+            u64 sum = 0;
+            for (int t = 0; t < NT; t++) sum += CYCT[t][10 + k];
+            fprintf(stderr, "    %-24s %8.1f Mtsc\n", dn[k], sum / 1e6);
+        }
+        fprintf(stderr, "    link table: 2^%d slots (%zu MB)\n", LT.bits, ((size_t)16 << LT.bits) >> 20);
+    }
 
     // ---- sessionize + attribute per shard
     const size_t CAMPW = (size_t)(NCAMP + 1) * NDAYS;
