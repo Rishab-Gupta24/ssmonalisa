@@ -1862,6 +1862,10 @@ int main() {
     }
     mark("dedup+resolve");
 
+    std::string udir = OUT + "/user_daily", cdir = OUT + "/campaign_daily";
+    mkdir(OUT.c_str(), 0777);
+    mkdir(udir.c_str(), 0777);
+    mkdir(cdir.c_str(), 0777);
     // ---- sessionize + attribute per shard
     const size_t CAMPW = (size_t)(NCAMP + 1) * NDAYS;
     std::vector<std::vector<u64>> camp(NT);
@@ -1903,7 +1907,7 @@ int main() {
             order[s] = {n, s};
         }
         std::sort(order.begin(), order.end(), std::greater<>());
-        run_tasks(K, [&](int t, size_t oi) {
+        auto shard_fn = [&](int t, size_t oi) {
             size_t s = (size_t)order[oi].second;
             static thread_local std::vector<u64> pkeys, E2;
             static thread_local std::vector<u32> eoff, coff;
@@ -2132,6 +2136,13 @@ int main() {
                     }
                 }
             }
+        };
+        // each thread writes its user_daily file as soon as it runs out of shards (overlaps the tail)
+        std::atomic<size_t> nextShard{0};
+        parallel(NT, [&](int t) {
+            size_t oi;
+            while ((oi = nextShard.fetch_add(1, std::memory_order_relaxed)) < (size_t)K) shard_fn(t, oi);
+            if (urowsN[t]) write_parquet(udir + "/part-" + std::to_string(t) + ".parquet", ucols[t], urowsN[t]);
         });
     }
     mark("sessionize");
@@ -2143,20 +2154,10 @@ int main() {
         });
     }
 
-    // ---- write outputs
-    std::string udir = OUT + "/user_daily", cdir = OUT + "/campaign_daily";
-    mkdir(OUT.c_str(), 0777);
-    mkdir(udir.c_str(), 0777);
-    mkdir(cdir.c_str(), 0777);
+    // ---- write outputs (user_daily files were written by the sessionize threads)
     size_t totalRows = 0;
     for (auto n : urowsN) totalRows += n;
-    std::vector<std::thread> writers;
-    for (int t = 0; t < NT; t++) {
-        if (!urowsN[t] && !(t == 0 && totalRows == 0)) continue;
-        writers.emplace_back([&, t]() {
-            write_parquet(udir + "/part-" + std::to_string(t) + ".parquet", ucols[t], urowsN[t]);
-        });
-    }
+    if (!totalRows) write_parquet(udir + "/part-0.parquet", ucols[0], 0);  // the folder needs a file
     {
         std::vector<PCol> cols(7);
         cols[0].name = "campaign_id", cols[0].type = P_BYTES, cols[0].logical = 1;
@@ -2185,7 +2186,6 @@ int main() {
             }
         write_parquet(cdir + "/part-0.parquet", cols, n);
     }
-    for (auto& w : writers) w.join();
     mark("done");
     _exit(0);
 }
