@@ -1616,6 +1616,8 @@ int main() {
     std::vector<std::vector<BList<ER>>> evParts(NT, std::vector<BList<ER>>(P));
     std::vector<BList<CK>> ckRaw(NT);
     std::vector<std::vector<std::pair<u64, std::string_view>>> regs(NT);
+    std::vector<std::vector<std::pair<u64, std::string_view>>> lkRegs(NT);  // link-chunk IDs (needed early)
+    RTable LT;
     {
         std::vector<Chunk> chunks;
         size_t target = std::max<size_t>(1 << 20, std::min<size_t>(8 << 20, totalBytes / (NT * 12) + 1));
@@ -1629,6 +1631,146 @@ int main() {
         });
         const i64 WSs = WS / SEC;
         std::atomic<size_t> nextChunk{0};
+        // ---- link build as six stages of tasks run inside the parse phase. Stage 0 starts once every
+        // link chunk is parsed; a stage's last finisher does the next stage's serial prep and opens it.
+        // Workers take link tasks first and parse event/click chunks while a stage is not yet open.
+        size_t lkChunksTotal = 0;
+        for (auto& c : chunks) lkChunksTotal += c.kind == 2;
+        std::atomic<size_t> lkChunksDone{0};
+        struct LStage {
+            size_t ntasks = 0;
+            std::atomic<size_t> next{0}, done{0};
+            std::atomic<int> ready{0};
+        };
+        LStage LS[6];
+        std::atomic<int> linksDone{0};
+        std::vector<size_t> rcount(257, 0), rbase(257, 0);
+        size_t rsize = 0, nlk = 0;
+        u64 *keyOf = nullptr, *minKey = nullptr;
+        u32 *parentRaw = nullptr, *root = nullptr;
+        struct PRef {  // relaxed atomic view over the parent array
+            u32* p;
+            u32 load(size_t i) const { return __atomic_load_n(&p[i], __ATOMIC_RELAXED); }
+            void store(size_t i, u32 v) const { __atomic_store_n(&p[i], v, __ATOMIC_RELAXED); }
+            bool cas(size_t i, u32 expect, u32 v) const {
+                return __atomic_compare_exchange_n(&p[i], &expect, v, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+            }
+        };
+        auto find = [&](u32 x) {
+            PRef parent{parentRaw};
+            while (true) {
+                u32 p = parent.load(x);
+                if (p == x) return x;
+                u32 gp = parent.load(p);
+                if (gp != p) parent.store(x, gp);  // path halving (benign)
+                x = gp;
+            }
+        };
+        auto stage_prep = [&](int k) {
+            if (k == 0) {
+                size_t upper = 0;
+                for (int t = 0; t < NT; t++)
+                    for (int r = 0; r < 256; r++) upper += lkKeys[t][r].size();
+                LT.init(std::max<size_t>(upper * 3 / 2, 1 << 16));
+                rsize = LT.rmask + 1;
+                LS[0].ntasks = 256;
+            } else if (k == 1) {
+                for (int r = 0; r < 256; r++) rbase[r + 1] = rbase[r] + rcount[r];
+                nlk = rbase[256];
+                keyOf = (u64*)ARENA.raw((nlk + 1) * sizeof(u64), false);
+                parentRaw = (u32*)ARENA.raw((nlk + 1) * sizeof(u32), false);
+                root = (u32*)ARENA.raw((nlk + 1) * sizeof(u32), false);
+                minKey = (u64*)ARENA.raw((nlk + 1) * sizeof(u64), false);
+                LS[1].ntasks = 256;
+            } else if (k == 2 || k == 3) {
+                LS[k].ntasks = NT;
+            } else if (k == 4) {
+                for (auto& r : lkRegs)  // minKey compares noncanonical link IDs by their strings
+                    for (auto& kv : r) REG.emplace(kv.first, std::string(kv.second));
+                LS[4].ntasks = NT;
+            } else {
+                LS[5].ntasks = 256;
+            }
+            LS[k].ready.store(1, std::memory_order_release);
+        };
+        auto stage_run = [&](int k, size_t i) {
+            if (k == 0) {  // region build
+                size_t r = i;
+                madvise((void*)(LT.s + r * rsize), rsize * sizeof(Slot), 23 /* MADV_POPULATE_WRITE */);
+                size_t local = 0;
+                for (int t = 0; t < NT; t++)
+                    lkKeys[t][r].each([&](u64 key) {
+                        size_t j = LT.start(key);
+                        while (true) {
+                            if (LT.s[j].k == key) break;
+                            if (!LT.s[j].k) {
+                                LT.s[j].k = key;
+                                LT.s[j].v = local++;
+                                break;
+                            }
+                            j = LT.next(j);
+                        }
+                    });
+                if (local >= rsize) die("link region overflow");
+                rcount[r] = local;
+            } else if (k == 1) {  // dense ids, parent init
+                Slot* s = LT.s + i * rsize;
+                for (size_t j = 0; j < rsize; j++)
+                    if (s[j].k) {
+                        size_t g = rbase[i] + s[j].v;
+                        keyOf[g] = s[j].k;
+                        parentRaw[g] = (u32)g;
+                    }
+            } else if (k == 2) {  // lock-free unions over thread i's pairs
+                PRef parent{parentRaw};
+                lkPairs[i].each([&](const PK& pr) {
+                    u32 a = (u32)(rbase[region_of(pr.a)] + LT.find(pr.a)->v);
+                    u32 b = (u32)(rbase[region_of(pr.b)] + LT.find(pr.b)->v);
+                    while (true) {
+                        a = find(a);
+                        b = find(b);
+                        if (a == b) break;
+                        if (a < b) std::swap(a, b);  // link larger root under smaller
+                        if (parent.cas(a, a, b)) break;
+                    }
+                });
+            } else if (k == 3) {  // roots
+                size_t lo = nlk * i / NT, hi = nlk * (i + 1) / NT;
+                for (size_t j = lo; j < hi; j++) root[j] = find((u32)j);
+            } else if (k == 4) {  // smallest ID per person: atomic minimum under byte-wise order
+                size_t lo = nlk * i / NT, hi = nlk * (i + 1) / NT;
+                for (size_t j = lo; j < hi; j++) {
+                    u64 key = keyOf[j];
+                    u64* slot = &minKey[root[j]];
+                    u64 cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
+                    while (cur == 0 || key_less(key, cur))
+                        if (__atomic_compare_exchange_n(slot, &cur, key, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                            break;
+                }
+            } else {  // person key into each link-table slot
+                Slot* s = LT.s + i * rsize;
+                for (size_t j = 0; j < rsize; j++)
+                    if (s[j].k) s[j].v = minKey[root[rbase[i] + s[j].v]];
+            }
+        };
+        auto try_link = [&]() -> bool {
+            for (int k = 0; k < 6; k++) {
+                if (!LS[k].ready.load(std::memory_order_acquire)) return false;
+                if (LS[k].done.load(std::memory_order_acquire) >= LS[k].ntasks) continue;  // stage complete
+                size_t i = LS[k].next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= LS[k].ntasks) return false;  // all taken, not all finished: later stages not open
+                stage_run(k, i);
+                if (LS[k].done.fetch_add(1, std::memory_order_acq_rel) + 1 == LS[k].ntasks) {
+                    if (k < 5)
+                        stage_prep(k + 1);
+                    else
+                        linksDone.store(1, std::memory_order_release);
+                }
+                return true;
+            }
+            return false;
+        };
+        if (lkChunksTotal == 0) stage_prep(0);
         parallel(NT, [&](int t) {
         // per-partition staging (4 records = 128 B, cache-line aligned), flushed with streaming stores
         ER* stage = (ER*)ARENA.get((size_t)P * 4 * sizeof(ER));
@@ -1638,7 +1780,7 @@ int main() {
             const Chunk& c = chunks[ci];
             const char *lb, *le;
             if (!load_chunk(files[c.file], c.s, c.e, buf, lb, le)) return;
-            auto& rg = regs[t];
+            auto& rg = c.kind == 2 ? lkRegs[t] : regs[t];
             auto save = [&](u64 k, const char* p, u32 n) {
                 char* d = (char*)ARENA.get(n + 1);
                 memcpy(d, p, n);
@@ -1751,11 +1893,19 @@ int main() {
                 });
             }
         };
-        size_t ci;
-        while ((ci = nextChunk.fetch_add(1, std::memory_order_relaxed)) < chunks.size()) {
+        while (true) {
+            if (try_link()) continue;  // link-build tasks first, whenever a stage is open
+            size_t ci = nextChunk.fetch_add(1, std::memory_order_relaxed);
+            if (ci >= chunks.size()) {
+                if (linksDone.load(std::memory_order_acquire)) break;
+                _mm_pause();  // chunks are done; wait for (and help) the remaining link stages
+                continue;
+            }
             u64 c0 = TIMING ? __rdtsc() : 0;
             body(ci);
             if (TIMING) CYCT[t][8 + chunks[ci].kind] += __rdtsc() - c0;
+            if (chunks[ci].kind == 2 && lkChunksDone.fetch_add(1, std::memory_order_acq_rel) + 1 == lkChunksTotal)
+                stage_prep(0);
             // drop this chunk's interior input pages from our page tables now (in parallel) instead of
             // at exit; two pages are kept at each end for neighbours' lookahead (a re-touch just refaults)
             const Chunk& c = chunks[ci];
@@ -1774,6 +1924,8 @@ int main() {
             for (auto& kv : r) REG.emplace(kv.first, std::string(kv.second));
             r.clear();
         }
+        for (auto& r : lkRegs)
+            for (auto& kv : r) REG.emplace(kv.first, std::string(kv.second));
     }
     mark("parse");
     if (TIMING) {
@@ -1785,111 +1937,7 @@ int main() {
         }
     }
 
-    // ---- link table + union-find
-    RTable LT;
-    {
-        size_t upper = 0;
-        for (int t = 0; t < NT; t++)
-            for (int r = 0; r < 256; r++) upper += lkKeys[t][r].size();
-        LT.init(std::max<size_t>(upper * 3 / 2, 1 << 16));
-        mark("  links: table alloc");
-        std::vector<size_t> rcount(257, 0);
-        size_t rsize = LT.rmask + 1;
-        run_tasks(256, [&](int, size_t r) {
-            madvise((void*)(LT.s + r * rsize), rsize * sizeof(Slot), 23 /* MADV_POPULATE_WRITE */);
-            size_t local = 0;
-            for (int t = 0; t < NT; t++)
-                lkKeys[t][r].each([&](u64 k) {
-                    size_t i = LT.start(k);
-                    while (true) {
-                        if (LT.s[i].k == k) break;
-                        if (!LT.s[i].k) {
-                            LT.s[i].k = k;
-                            LT.s[i].v = local++;
-                            break;
-                        }
-                        i = LT.next(i);
-                    }
-                });
-            if (local >= rsize) die("link region overflow");
-            rcount[r] = local;
-        });
-        mark("  links: region build");
-        std::vector<size_t> rbase(257, 0);
-        for (int r = 0; r < 256; r++) rbase[r + 1] = rbase[r] + rcount[r];
-        size_t n = rbase[256];
-        // arena arrays (fresh, zero-filled), initialized in parallel
-        u64* keyOf = (u64*)ARENA.raw((n + 1) * sizeof(u64), false);
-        u32* parentRaw = (u32*)ARENA.raw((n + 1) * sizeof(u32), false);
-        u32* root = (u32*)ARENA.raw((n + 1) * sizeof(u32), false);
-        u64* minKey = (u64*)ARENA.raw((n + 1) * sizeof(u64), false);
-        run_tasks(256, [&](int, size_t r) {
-            Slot* s = LT.s + r * rsize;
-            for (size_t i = 0; i < rsize; i++)
-                if (s[i].k) {
-                    size_t g = rbase[r] + s[i].v;
-                    keyOf[g] = s[i].k;
-                    parentRaw[g] = (u32)g;
-                }
-        });
-        struct PRef {  // relaxed atomic view over the parent array
-            u32* p;
-            u32 load(size_t i) const { return __atomic_load_n(&p[i], __ATOMIC_RELAXED); }
-            void store(size_t i, u32 v) const { __atomic_store_n(&p[i], v, __ATOMIC_RELAXED); }
-            bool cas(size_t i, u32 expect, u32 v) const {
-                return __atomic_compare_exchange_n(&p[i], &expect, v, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
-            }
-        } parent{parentRaw};
-        mark("  links: keyOf+parent init");
-        auto find = [&](u32 x) {
-            while (true) {
-                u32 p = parent.load(x);
-                if (p == x) return x;
-                u32 gp = parent.load(p);
-                if (gp != p) parent.store(x, gp);  // path halving (benign)
-                x = gp;
-            }
-        };
-        auto gidx = [&](u64 k) -> u32 {
-            const Slot* sl = LT.find(k);
-            return (u32)(rbase[region_of(k)] + sl->v);
-        };
-        run_tasks(NT, [&](int, size_t t) {
-            lkPairs[t].each([&](const PK& pr) {
-                u32 a = gidx(pr.a), b = gidx(pr.b);
-                while (true) {
-                    a = find(a);
-                    b = find(b);
-                    if (a == b) break;
-                    if (a < b) std::swap(a, b);  // link larger root under smaller
-                    if (parent.cas(a, a, b)) break;
-                }
-            });
-        });
-        mark("  links: unions");
-        run_tasks(NT, [&](int, size_t t) {
-            size_t lo = n * t / NT, hi = n * (t + 1) / NT;
-            for (size_t i = lo; i < hi; i++) root[i] = find((u32)i);
-        });
-        mark("  links: roots");
-        // smallest ID per person: parallel atomic minimum under byte-wise order (keys are never 0)
-        run_tasks(NT, [&](int, size_t t) {
-            size_t lo = n * t / NT, hi = n * (t + 1) / NT;
-            for (size_t i = lo; i < hi; i++) {
-                u64 k = keyOf[i];
-                u64* slot = &minKey[root[i]];
-                u64 cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
-                while (cur == 0 || key_less(k, cur))
-                    if (__atomic_compare_exchange_n(slot, &cur, k, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
-            }
-        });
-        mark("  links: minKey");
-        run_tasks(256, [&](int, size_t r) {
-            Slot* s = LT.s + r * rsize;
-            for (size_t i = 0; i < rsize; i++)
-                if (s[i].k) s[i].v = minKey[root[rbase[r] + s[i].v]];
-        });
-    }
+    // (link table + union-find now run as stages inside the parse phase)
     mark("links");
     const size_t arenaDeadEnd = ARENA.off.load();  // everything below is dead once dedup is done
 
