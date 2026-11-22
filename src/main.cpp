@@ -17,16 +17,13 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 typedef uint64_t u64;
 typedef int64_t i64;
 typedef uint32_t u32;
 typedef int32_t i32;
-typedef uint16_t u16;
 typedef uint8_t u8;
 
 static const i64 SEC = 1000, DAYMS = 86400000LL, WEEK = 7 * DAYMS;
@@ -34,8 +31,6 @@ static const i64 TS_BAD = INT64_MIN;
 static const u32 TS_INVALID = 0xFFFFFFFFu;
 
 static int NT = 8;
-static bool POPULATE_INPUT = true;
-static bool USE_NT = true;
 
 static void die(const char* m) {
     fprintf(stderr, "fatal: %s\n", m);
@@ -43,55 +38,12 @@ static void die(const char* m) {
 }
 
 static double T0 = 0;
-static bool TIMING = false;
+static bool TIMING = false;  // SS_TIMING=1: phase wall times on stderr
 static double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-// user-space instruction counter for this process and threads created later (debug only)
-static int PERF_FD = -1, PERF_FDS[4] = {-1, -1, -1, -1};
-static void perf_init() {
-    struct {
-        u32 type, size;
-        u64 config, sample_period, sample_type, read_format, flags;
-        u32 wakeup, bp_type;
-        u64 bp_addr, bp_len, branch_sample_type, sample_regs_user;
-        u32 sample_stack_user;
-        i32 clockid;
-        u64 sample_regs_intr;
-        u32 aux_watermark;
-        u16 sample_max_stack, reserved;
-        u32 aux_sample_size, reserved3;
-        u64 sig_data, config3;
-    } a;
-    memset(&a, 0, sizeof a);
-    a.type = 0;    // PERF_TYPE_HARDWARE
-    a.size = 128;  // PERF_ATTR_SIZE_VER7 or so; kernel accepts smaller known sizes
-    // flags: disabled=0, inherit=bit1, exclude_kernel=bit5, exclude_hv=bit6
-    a.flags = (1ULL << 1) | (1ULL << 5) | (1ULL << 6);
-    const u64 cfg[4] = {1 /* instructions */, 0 /* cycles */, 5 /* branch misses */, 3 /* cache misses */};
-    for (int i = 0; i < 4; i++) {
-        a.config = cfg[i];
-        PERF_FDS[i] = (int)syscall(298 /* perf_event_open */, &a, 0, -1, -1, 0);
-    }
-    PERF_FD = PERF_FDS[0];
-}
-static u64 perf_read(int i = 0) {
-    u64 v = 0;
-    if (PERF_FDS[i] >= 0 && read(PERF_FDS[i], &v, 8) != 8) v = 0;
-    return v;
-}
 static void mark(const char* what) {
-    if (!TIMING) return;
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
-    double us = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, sy = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
-    static u64 last[4];
-    u64 v[4], d[4];
-    for (int i = 0; i < 4; i++) v[i] = perf_read(i), d[i] = v[i] - last[i], last[i] = v[i];
-    fprintf(stderr,
-            "%8.1f ms  user %7.1f  sys %7.1f | phase: Minstr %7.1f  Mcyc %7.1f  IPC %.2f  Mbrmiss %6.1f  Mcachemiss %6.1f  %s\n",
-            (now_s() - T0) * 1000, us * 1000, sy * 1000, d[0] / 1e6, d[1] / 1e6, d[1] ? (double)d[0] / d[1] : 0.0,
-            d[2] / 1e6, d[3] / 1e6, what);
+    if (TIMING) fprintf(stderr, "%8.1f ms  %s\n", (now_s() - T0) * 1000, what);
 }
 
 // ---------------------------------------------------------------- threads
@@ -476,33 +428,6 @@ __attribute__((always_inline)) static inline u64 enc_key(const char* s, size_t n
     return enc_key_slow(s, n, canon);
 }
 
-[[maybe_unused]] static inline u64 enc_key_swar(const char* s, size_t n, bool& canon) {
-    if (n >= 1 && n <= 9 && (unsigned)(s[0] - 'a') < 26) {
-        u64 x;
-        memcpy(&x, s + 1, 8);
-        size_t r = n - 1;
-        u64 keep = r == 8 ? ~0ULL : ((1ULL << (8 * r)) - 1);
-        x &= keep;
-        const u64 H = 0x8080808080808080ULL, L = 0x0101010101010101ULL;
-        if (!(x & H)) {
-            u64 xh = x | H;
-            auto ge = [&](u64 c) { return (xh - L * c) & H; };  // high bit set where byte >= c
-            u64 isd = ge('0') & ~ge('9' + 1);
-            u64 isl = ge('a') & ~ge('z' + 1);
-            u64 isu = ge('_') & ~ge('_' + 1);
-            if (!(keep & H & ~(isd | isl | isu))) {
-                u64 dm = (isd >> 7) * 0xFF, lm = (isl >> 7) * 0xFF, um = (isu >> 7) * 0xFF;
-                u64 code = (((xh - L * 0x2F) & (L * 0x7F)) & dm) | (((xh - L * 0x55) & (L * 0x7F)) & lm) |
-                           ((L * 11) & um);
-                canon = true;
-                return ((u64)(s[0] - 'a' + 1) << 48) | _pext_u64(__builtin_bswap64(code), L * 0x3F);
-            }
-        }
-    }
-    canon = false;
-    return hash_bytes(s, n) | NONCANON;
-}
-
 static inline u64 enc_key_ref(const char* s, size_t n, bool& canon) {
     if (n >= 1 && n <= 9 && (unsigned)(s[0] - 'a') < 26) {
         u64 k = (u64)(s[0] - 'a' + 1) << 48;
@@ -652,18 +577,6 @@ static inline int region_of(u64 key) { return (int)(mix64(key) >> 56); }
 struct Masks {
     std::vector<u64> nl, cm, q;  // newlines, commas, quotes
 };
-// AVX-512BW: one 64-byte load and three compare-to-mask instructions per word (runtime-dispatched)
-static bool HAS_AVX512 = false;
-__attribute__((target("avx512f,avx512bw"))) static void build_masks_512(const char* b, size_t W, u64* nl, u64* cm,
-                                                                         u64* q) {
-    const __m512i NL = _mm512_set1_epi8('\n'), CM = _mm512_set1_epi8(','), QT = _mm512_set1_epi8('"');
-    for (size_t w = 0; w < W; w++) {
-        __m512i v = _mm512_loadu_si512((const void*)(b + (w << 6)));
-        nl[w] = _mm512_cmpeq_epi8_mask(v, NL);
-        cm[w] = _mm512_cmpeq_epi8_mask(v, CM);
-        q[w] = _mm512_cmpeq_epi8_mask(v, QT);
-    }
-}
 static void build_masks(const char* b, size_t N, Masks& M) {
     size_t W = (N >> 6) + 1;
     if (M.nl.size() < W + 3) {
@@ -674,9 +587,6 @@ static void build_masks(const char* b, size_t N, Masks& M) {
     u64* nl = M.nl.data();
     u64* sep = M.cm.data();
     u64* q = M.q.data();
-    if (HAS_AVX512) {
-        build_masks_512(b, W, nl, sep, q);
-    } else {
     const __m256i NL = _mm256_set1_epi8('\n'), CM = _mm256_set1_epi8(','), QT = _mm256_set1_epi8('"');
     for (size_t w = 0; w < W; w++) {
         __m256i v0 = _mm256_loadu_si256((const __m256i*)(b + (w << 6)));
@@ -690,7 +600,6 @@ static void build_masks(const char* b, size_t N, Masks& M) {
         nl[w] = n;
         sep[w] = c;  // commas only
         q[w] = qq;
-    }
     }
     u64 bit = 1ULL << (N & 63);
     nl[N >> 6] |= bit;  // virtual newline at N
@@ -707,10 +616,8 @@ static inline u32 range_pop(const u64* q, size_t a, size_t b) {  // popcount of 
     for (size_t w = wa + 1; w < wb; w++) c += (u32)__builtin_popcountll(q[w]);
     return c;
 }
-static inline bool bit_at(const u64* m, size_t i) { return (m[i >> 6] >> (i & 63)) & 1; }
 
 // Calls fn(fp, fl) for every well-formed row (rules.md dialect) in [b, lim).
-static u64 CYCT[64][16];  // per-thread cycle accumulators (SS_TIMING)
 template <int NF, class F>
 static inline void for_rows(const char* b, const char* lim, F fn) {
     static thread_local Masks M;
@@ -879,17 +786,6 @@ static inline void for_rows(const char* b, const char* lim, F fn) {
     }
 }
 
-__attribute__((noinline)) u64 bench_enc(const char* s, size_t n) {
-    bool c;
-    return enc_key(s, n, c);
-}
-__attribute__((noinline)) i64 bench_ts(const char* s, size_t n) { return parse_ts_fast(s, n); }
-__attribute__((noinline)) u64 bench_walk(const char* b, const char* lim) {
-    u64 x = 0;
-    for_rows<7>(b, lim, [&](const char**, const u32* fl) { x += fl[0]; });
-    return x;
-}
-
 // small clean files (products, campaigns)
 template <int NF, class F>
 static void for_rows_text(const std::string& t, F fn) {
@@ -916,7 +812,7 @@ static bool load_chunk(const InFile& f, size_t s, size_t e, std::vector<char>& b
     if (f.map && e + EXTRA < f.n) {
         // zero-copy: every line we touch, plus 64 bytes of SIMD over-read, lies inside the file
         const char* b = f.map;
-        if (POPULATE_INPUT) {  // map this chunk's page-cache pages in one call instead of per-page faults
+        {  // map this chunk's page-cache pages in one call instead of per-page faults
             size_t a0 = rs & ~(size_t)4095, a1 = std::min(f.n, e + 4096);
             madvise((void*)(b + a0), a1 - a0, 22 /* MADV_POPULATE_READ */);
         }
@@ -1086,13 +982,10 @@ static std::string rle_levels(const std::vector<u8>& d) {
 static void write_parquet(const std::string& path, std::vector<PCol>& cols, size_t nrows) {
     int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) die("cannot write parquet");
-    std::string head = "PAR1";
-    i64 pos = 0;
     struct Meta {
         i64 off, size;
     };
     std::vector<Meta> metas;
-    std::vector<std::string> parts;  // header/levels pieces, written in order with data
     auto wr = [&](const char* p, size_t n) {
         while (n) {
             ssize_t r = write(fd, p, n);
@@ -1100,10 +993,9 @@ static void write_parquet(const std::string& path, std::vector<PCol>& cols, size
             p += r;
             n -= r;
         }
-        pos += 0;
     };
-    wr(head.data(), 4);
-    pos = 4;
+    wr("PAR1", 4);
+    i64 pos = 4;
     for (auto& c : cols) {
         std::string lv;
         if (c.optional) lv = rle_levels(c.def);
@@ -1179,13 +1071,8 @@ static void write_parquet(const std::string& path, std::vector<PCol>& cols, size
     m.send();
     m.binf(6, "ssmonalisa");
     m.b.push_back(0);
-    put_u32(m.b, (u32)(m.b.size()));
+    put_u32(m.b, (u32)m.b.size());  // footer length (metadata only), then the magic
     m.b += "PAR1";
-    // footer length must exclude the 4-byte length and magic: fix up
-    {
-        u32 flen = (u32)(m.b.size() - 8);
-        memcpy(&m.b[m.b.size() - 8], &flen, 4);
-    }
     wr(m.b.data(), m.b.size());
     close(fd);
 }
@@ -1195,13 +1082,6 @@ static inline void col_i32(PCol& c, i32 v) { c.data.append((const char*)&v, 4); 
 static inline void col_str(PCol& c, const std::string& s) {
     put_u32(c.data, (u32)s.size());
     c.data += s;
-}
-static inline void col_key(PCol& c, u64 k) {
-    size_t at = c.data.size();
-    c.data.append(4, '\0');
-    key_append(k, c.data);
-    u32 n = (u32)(c.data.size() - at - 4);
-    memcpy(&c.data[at], &n, 4);
 }
 
 // ---------------------------------------------------------------- sorting helpers
@@ -1408,12 +1288,6 @@ static int selftest(i64 WS) {
 int main() {
     T0 = now_s();
     TIMING = getenv("SS_TIMING") != nullptr;
-    if (TIMING) perf_init();
-    if (getenv("SS_NOPOP")) POPULATE_INPUT = false;
-    if (getenv("SS_NONT")) USE_NT = false;
-    __builtin_cpu_init();
-    // opt-in: on Cascade Lake, 512-bit ops lower the core clock license, which can cost more than they save
-    HAS_AVX512 = getenv("SS_AVX512") && __builtin_cpu_supports("avx512bw");
     init_ch();
     const char* ev;
     std::string DATA = (ev = getenv("DATA_DIR")) ? ev : "/data";
@@ -1459,7 +1333,6 @@ int main() {
     for (auto& f : files) totalBytes += f.n;
     ARENA.init(totalBytes * 2 + ((size_t)1 << 30));
 
-    mark("  input files + arena");
     // ---- products / categories
     std::vector<std::string> cats;
     HMap prodMap;
@@ -1519,7 +1392,6 @@ int main() {
         for (size_t r = 0; r < ord.size(); r++) catRank[ord[r]] = (int)r;
     }
 
-    mark("  products");
     // ---- campaigns
     std::vector<std::string> campIds, campCh;
     HMap campMap;
@@ -1542,58 +1414,6 @@ int main() {
     const int ORGANIC = NCAMP;
     mark("metadata");
 
-    if (getenv("SS_BENCH")) {  // single-threaded instructions-per-call micro-benchmarks on real fields
-        perf_init();
-        int fi = -1;
-        for (size_t f = 0; f < files.size(); f++)
-            if (kindOf[f] == 0 && (fi < 0 || files[f].n > files[fi].n)) fi = (int)f;
-        if (fi < 0) _exit(1);
-        size_t n = std::min<size_t>(files[fi].n, 64u << 20);
-        std::vector<char> buf(n + 128, 0);
-        pread_all(files[fi].fd, buf.data(), n, 0);
-        const char* b = (const char*)memchr(buf.data(), '\n', n) + 1;
-        const char* lim = buf.data() + n;
-        while (lim > b && lim[-1] != '\n') lim--;
-        lim--;
-        std::vector<std::pair<const char*, u32>> F[7];
-        u64 lines = 0, sink = 0;
-        auto measure = [&](const char* name, size_t calls, auto&& fn) {
-            u64 i0 = perf_read(0), c0 = perf_read(1);
-            fn();
-            u64 i1 = perf_read(0), c1 = perf_read(1);
-            fprintf(stderr, "  %-26s %8.1f instr/call  %8.1f cyc/call  (%zu calls)\n", name, (double)(i1 - i0) / calls,
-                    (double)(c1 - c0) / calls, calls);
-        };
-        for_rows<7>(b, lim, [&](const char** fp, const u32* fl) {
-            for (int k = 0; k < 7; k++) F[k].push_back({fp[k], fl[k]});
-        });
-        size_t rows = F[0].size();
-        {
-            Masks MB;
-            build_masks(b, lim - b, MB);  // warm (allocation)
-            measure("build_masks only", rows, [&] { build_masks(b, lim - b, MB); });
-        }
-        measure("for_rows<7> walk+fields", rows, [&] {
-            for_rows<7>(b, lim, [&](const char**, const u32* fl) { lines += fl[0]; });
-        });
-        measure("enc_key(event_id)", rows, [&] {
-            for (auto& x : F[0]) { bool c; sink += enc_key(x.first, x.second, c); }
-        });
-        measure("enc_key(user_id)", rows, [&] {
-            for (auto& x : F[1]) { bool c; sink += enc_key(x.first, x.second, c); }
-        });
-        measure("parse_ts_fast(ts)", rows, [&] {
-            for (auto& x : F[2]) sink += (u64)parse_ts_fast(x.first, x.second);
-        });
-        measure("parse_ts_fast(ingest_ts)", rows, [&] {
-            for (auto& x : F[3]) sink += (u64)parse_ts_fast(x.first, x.second);
-        });
-        measure("mix64 partition", rows, [&] {
-            for (auto& x : F[0]) sink += mix64((u64)x.second * 0x9E3779B97F4A7C15ULL + (u64)(uintptr_t)x.first);
-        });
-        fprintf(stderr, "  (sink %llu %llu)\n", (unsigned long long)sink, (unsigned long long)lines);
-        _exit(0);
-    }
 
     // ---- parse links + events + clicks in one parallel pass
     // event dedup partitions: ~12k rows each, so a partition's hash table (2x slots, 16 B) is ~512 KB
@@ -1858,10 +1678,6 @@ int main() {
                         r.packed = packed;
                     } while (0);
                     int p = ppart(r.eid);
-                    if (!USE_NT) {
-                        parts[p].push(r, 256);
-                        return;
-                    }
                     ER* sb = stage + (size_t)p * 4;
                     sb[scnt[p]] = r;
                     if (++scnt[p] == 4) {
@@ -1901,9 +1717,7 @@ int main() {
                 _mm_pause();  // chunks are done; wait for (and help) the remaining link stages
                 continue;
             }
-            u64 c0 = TIMING ? __rdtsc() : 0;
             body(ci);
-            if (TIMING) CYCT[t][8 + chunks[ci].kind] += __rdtsc() - c0;
             if (chunks[ci].kind == 2 && lkChunksDone.fetch_add(1, std::memory_order_acq_rel) + 1 == lkChunksTotal)
                 stage_prep(0);
             // drop this chunk's interior input pages from our page tables now (in parallel) instead of
@@ -1928,14 +1742,6 @@ int main() {
             for (auto& kv : r) REG.emplace(kv.first, std::string(kv.second));
     }
     mark("parse");
-    if (TIMING) {
-        const char* kn[3] = {"events", "clicks", "links"};
-        for (int k = 0; k < 3; k++) {
-            u64 sum = 0;
-            for (int t = 0; t < NT; t++) sum += CYCT[t][8 + k];
-            fprintf(stderr, "    parse %-7s %8.1f Mtsc\n", kn[k], sum / 1e6);
-        }
-    }
 
     // (link table + union-find now run as stages inside the parse phase)
     mark("links");
@@ -1984,7 +1790,6 @@ int main() {
         auto task_fn = [&](size_t task) {
             static thread_local HMap m;
             static thread_local std::vector<const ER*> buf, surv;
-            u64 d0 = TIMING ? __rdtsc() : 0;
             if (task < (size_t)P) {
                 int p = (int)task;
                 size_t n = 0;
@@ -2007,7 +1812,6 @@ int main() {
                                 buf[*v] = &r;
                         }
                     }
-                u64 d1 = TIMING ? __rdtsc() : 0;
                 surv.clear();
                 for (const ER* r : buf)
                     if (r->ts != TS_INVALID) surv.push_back(r);
@@ -2019,7 +1823,6 @@ int main() {
                     u64 pk = sl ? sl->v : r.ukey;
                     emit(pshard(pk), EV{pk, r.ts, r.packed});
                 }
-                if (TIMING) CYCT[t][10] += d1 - d0, CYCT[t][11] += __rdtsc() - d1;
             } else {
                 auto* b = ckBlocks[task - P];
                 CK* it = b->items();
@@ -2030,7 +1833,6 @@ int main() {
                     u64 pk = sl ? sl->v : it[i].ukey;
                     emitc(pshard(pk), CR{pk, it[i].cid, it[i].ts, it[i].camp});
                 }
-                if (TIMING) CYCT[t][12] += __rdtsc() - d0;
             }
         };
         size_t tk;
@@ -2043,15 +1845,6 @@ int main() {
         });
     }
     mark("dedup+resolve");
-    if (TIMING) {
-        const char* dn[3] = {"dedup map build", "survivors resolve+emit", "clicks resolve"};
-        for (int k = 0; k < 3; k++) {
-            u64 sum = 0;
-            for (int t = 0; t < NT; t++) sum += CYCT[t][10 + k];
-            fprintf(stderr, "    %-24s %8.1f Mtsc\n", dn[k], sum / 1e6);
-        }
-        fprintf(stderr, "    link table: 2^%d slots (%zu MB)\n", LT.bits, ((size_t)16 << LT.bits) >> 20);
-    }
 
     // release parse records, link structures and parse staging (dead now) in parallel, so the
     // kernel does not free them single-threaded at exit
@@ -2104,7 +1897,6 @@ int main() {
             order[s] = {n, s};
         }
         std::sort(order.begin(), order.end(), std::greater<>());
-        if (TIMING) fprintf(stderr, "  largest shard %zu rows, median %zu\n", order[0].first, order[K / 2].first);
         run_tasks(K, [&](int t, size_t oi) {
             size_t s = (size_t)order[oi].second;
             static thread_local std::vector<u64> pkeys, E2;
@@ -2133,7 +1925,6 @@ int main() {
             u64* cr = cs + 2 * CAMPW;
             u64* ca = cs + 3 * CAMPW;
 
-            u64 tc0 = TIMING ? __rdtsc() : 0;
             size_t ne = 0, nc = 0;
             for (int q = 0; q < NT; q++) ne += evShards[q][s].size(), nc += ckShards[q][s].size();
             if (!ne) return;
@@ -2173,7 +1964,6 @@ int main() {
                     sum += c;
                 }
             }
-            u64 tc1 = TIMING ? __rdtsc() : 0;
             // sort the whole shard by ts (stable radix), then a stable scatter by person:
             // every person's events come out grouped and already in ts order
             E2.resize(ne);
@@ -2186,7 +1976,6 @@ int main() {
                     E2[wp[r.pi]++] = ((u64)r.ts << 32) | r.packed;
                 }
             }
-            u64 tc2 = TIMING ? __rdtsc() : 0;
             // clicks of these persons
             cstart.assign(np + 1, 0);
             CA.resize(nc);
@@ -2220,12 +2009,6 @@ int main() {
                 }
             }
 
-            if (TIMING) {
-                u64 tc3 = __rdtsc();
-                CYCT[t][0] += tc1 - tc0;
-                CYCT[t][1] += tc2 - tc1;
-                CYCT[t][2] += tc3 - tc2;
-            }
             for (size_t pi = 0; pi < np; pi++) {
                 u64 pk = pkeys[pi];
                 // the person's name, length-prefixed, encoded once for all of their day rows
@@ -2238,11 +2021,9 @@ int main() {
                 }
                 u64* Ep = E2.data() + eoff[pi];
                 size_t en = eoff[pi + 1] - eoff[pi];
-                u64 tp0 = TIMING ? __rdtsc() : 0;
                 // events and clicks are already in ts order (shard-level radix + stable scatter)
                 C2* Cp = Cv.data() + cstart[pi];
                 size_t cn = cstart[pi + 1] - cstart[pi];
-                u64 tp1 = TIMING ? __rdtsc() : 0;
                 // sessions + user-day rows
                 S.clear();
                 int curDay = -1;
@@ -2304,7 +2085,6 @@ int main() {
                     S.push_back(se);
                 }
                 flush_day();
-                u64 tp2 = TIMING ? __rdtsc() : 0;
                 // attribution
                 size_t lo = 0, hi = 0;
                 u32 nS = (u32)S.size();
@@ -2345,12 +2125,6 @@ int main() {
                         cnt[c] = 0;
                     }
                 }
-                if (TIMING) {
-                    u64 tp3 = __rdtsc();
-                    CYCT[t][3] += tp1 - tp0;
-                    CYCT[t][4] += tp2 - tp1;
-                    CYCT[t][5] += tp3 - tp2;
-                }
             }
         });
     }
@@ -2362,14 +2136,6 @@ int main() {
             size_t lo = (lo0 + span * t) & ~(Arena::HUGE - 1), hi = t + 1 == (size_t)NT ? end : ((lo0 + span * (t + 1)) & ~(Arena::HUGE - 1));
             if (hi > lo) madvise(ARENA.base + lo, hi - lo, MADV_DONTNEED);
         });
-    }
-    if (TIMING) {
-        const char* nm[6] = {"ev gather+count", "ev scatter", "clicks", "sort", "sessions+rows", "attribution"};
-        for (int k = 0; k < 6; k++) {
-            u64 sum = 0;
-            for (int t = 0; t < NT; t++) sum += CYCT[t][k];
-            fprintf(stderr, "    %-16s %7.1f Mcycles\n", nm[k], sum / 1e6);
-        }
     }
 
     // ---- write outputs
@@ -2416,11 +2182,5 @@ int main() {
     }
     for (auto& w : writers) w.join();
     mark("done");
-    if (TIMING) {
-        std::string sm = read_small("/proc/self/smaps_rollup");
-        size_t p = sm.find("AnonHugePages");
-        if (p != std::string::npos) fprintf(stderr, "%s\n", sm.substr(p, sm.find('\n', p) - p).c_str());
-        fprintf(stderr, "arena used %zu MB\n", ARENA.off.load() >> 20);
-    }
     _exit(0);
 }
