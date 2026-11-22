@@ -698,184 +698,120 @@ static void build_masks(const char* b, size_t N, Masks& M) {
     sep[W] = q[W] = 0;
 }
 
-static inline u32 range_pop(const u64* q, size_t a, size_t b) {  // popcount of bits [a, b)
-    if (a >= b) return 0;
-    size_t wa = a >> 6, wb = (b - 1) >> 6;
-    u64 lo = ~0ULL << (a & 63), hi = ~0ULL >> (63 - ((b - 1) & 63));
-    if (wa == wb) return (u32)__builtin_popcountll(q[wa] & lo & hi);
-    u32 c = (u32)__builtin_popcountll(q[wa] & lo) + (u32)__builtin_popcountll(q[wb] & hi);
-    for (size_t w = wa + 1; w < wb; w++) c += (u32)__builtin_popcountll(q[w]);
-    return c;
-}
-static inline bool bit_at(const u64* m, size_t i) { return (m[i >> 6] >> (i & 63)) & 1; }
-
-// Calls fn(fp, fl) for every well-formed row (rules.md dialect) in [b, lim).
 static u64 CYCT[64][16];  // per-thread cycle accumulators (SS_TIMING)
+
+// A line longer than the tile is rare. Decode it directly without allocating
+// an index proportional to its length.
+template <int NF, class F>
+static void long_csv_row(const char* b, const char* end, F& fn) {
+    const char* fields[NF];
+    u32 lengths[NF];
+    for (int k = 0; k < NF; ++k) {
+        const char* comma = (const char*)memchr(b, ',', end - b);
+        if ((comma == nullptr) != (k == NF - 1)) return;
+        const char* stop = comma ? comma : end;
+        std::string_view field(b, stop - b);
+        if (field.size() >= 2 && field.front() == '"' && field.back() == '"') {
+            field.remove_prefix(1);
+            field.remove_suffix(1);
+        }
+        if (field.find('"') != field.npos) return;
+        fields[k] = field.data();
+        lengths[k] = field.size();
+        if (comma) b = comma + 1;
+    }
+    fn(fields, lengths);
+}
+
+// A tile ends at a real or virtual newline. Index its delimiters once so the
+// fixed-width row decoder can read all field boundaries independently.
+static constexpr unsigned CSV_TILE = 8192;
+struct CsvIndex {
+    Masks masks;
+    u16 ends[CSV_TILE + 1], lines[CSV_TILE + 1], errors[CSV_TILE + 2];
+    unsigned nends, nlines;
+    void build(const char* b, unsigned n) {
+        build_masks(b, n, masks);
+        nends = nlines = 0;
+        unsigned nerrors = 0;
+        const unsigned last = n / 64;
+        const u64 end = 1ULL << (n % 64);
+        masks.cm[last] &= end - 1;
+        masks.q[last] &= end - 1;
+        masks.nl[last] = (masks.nl[last] & (end - 1)) | end;
+        bool previous_sep = true, previous_quote = false, field_quoted = n && b[0] == '"';
+        for (unsigned w = 0; w <= last; ++w) {
+            const u64 lines_here = masks.nl[w];
+            const u64 sep = lines_here | masks.cm[w], quotes = masks.q[w];
+            const u64 next_sep = w < last ? (masks.cm[w + 1] | masks.nl[w + 1]) : 0;
+            const u64 next_quote = w < last ? masks.q[w + 1] : 0;
+            // Every quote must touch exactly one delimiter. The tile starts
+            // just after an implicit delimiter, including at the start of a file.
+            const u64 after_sep = (sep << 1) | previous_sep;
+            const u64 before_sep = (sep >> 1) | (next_sep << 63);
+            u64 bad = quotes & ~(after_sep ^ before_sep);
+            if (sep) {
+                // One bit per delimiter: does the preceding field close with
+                // a quote, and does the following field open with one?
+                const u64 closes = _pext_u64((quotes << 1) | previous_quote, sep);
+                const u64 opens = _pext_u64((quotes >> 1) | (next_quote << 63), sep);
+                const unsigned count = __builtin_popcountll(sep);
+                const u64 mismatch = closes ^ _bzhi_u64((opens << 1) | field_quoted, count);
+                if (mismatch) bad |= _pdep_u64(mismatch, sep);
+                field_quoted = (opens >> (count - 1)) & 1;
+            }
+            previous_sep = sep >> 63;
+            previous_quote = quotes >> 63;
+            for (u64 m = sep; m; m &= m - 1)
+                ends[nends++] = w * 64 + __builtin_ctzll(m);
+            for (u64 m = lines_here; m; m &= m - 1)
+                lines[nlines++] = w * 64 + __builtin_ctzll(m);
+            for (; bad; bad &= bad - 1)
+                errors[nerrors++] = w * 64 + __builtin_ctzll(bad);
+        }
+        errors[nerrors] = UINT16_MAX;
+    }
+};
+
 template <int NF, class F>
 static inline void for_rows(const char* b, const char* lim, F fn) {
-    static thread_local Masks M;
-    size_t N = lim - b;
-    if (!N) return;
-    build_masks(b, N, M);
-    const u64* nl = M.nl.data();
-    const u64* cm = M.cm.data();
-    const u64* q = M.q.data();
-    const char* fp[NF];
-    u32 fl[NF];
-    size_t ends[NF];
-    size_t pos = 0;
-    while (pos <= N) {
-        {  // fast path: the line fits in a 128-bit window of each mask, aligned at the line start
-            size_t w0 = pos >> 6;
-            unsigned sh = (unsigned)(pos & 63);
-            auto win = [&](const u64* m, u64& lo, u64& hi) {
-                u64 a = m[w0], b1 = m[w0 + 1];
-                if (sh) {
-                    u64 c = m[w0 + 2];
-                    lo = (a >> sh) | (b1 << (64 - sh));
-                    hi = (b1 >> sh) | (c << (64 - sh));
+    static thread_local CsvIndex index;
+    while (b < lim) {
+        const char* end = lim;
+        if ((size_t)(lim - b) > CSV_TILE) {
+            end = (const char*)memrchr(b, '\n', CSV_TILE);
+            if (!end) end = (const char*)memchr(b + CSV_TILE, '\n', lim - b - CSV_TILE);
+            if (!end) end = lim;
+        }
+        const size_t n = end - b;
+        if (n > CSV_TILE) {
+            long_csv_row<NF>(b, end, fn);
+        } else {
+            index.build(b, (unsigned)n);
+            unsigned i = 0, start = 0, error = 0;
+            for (unsigned line = 0; line < index.nlines; ++line) {
+                const unsigned line_end = index.lines[line];
+                if (index.errors[error] > line_end && i + NF <= index.nends && index.ends[i + NF - 1] == line_end) {
+                    const char* fields[NF];
+                    u32 lengths[NF];
+                    for (int k = 0; k < NF; ++k) {
+                        unsigned s = k ? index.ends[i + k - 1] + 1 : start;
+                        unsigned quoted = s < line_end && b[s] == '"';
+                        fields[k] = b + s + quoted;
+                        lengths[k] = index.ends[i + k] - s - 2 * quoted;
+                    }
+                    fn(fields, lengths);
+                    i += NF;
                 } else {
-                    lo = a;
-                    hi = b1;
+                    while (index.errors[error] <= line_end) ++error;
+                    while (index.ends[i] < line_end) ++i;
+                    ++i;
                 }
-            };
-            u64 nlo, nhi;
-            win(nl, nlo, nhi);
-            if (nlo | nhi) {
-                size_t ls = pos;
-                size_t len = nlo ? (size_t)__builtin_ctzll(nlo) : 64 + (size_t)__builtin_ctzll(nhi);
-                pos = ls + len + 1;
-                u64 mlo, mhi;  // bits [0, len)
-                if (len < 64) {
-                    mlo = (1ULL << len) - 1;
-                    mhi = 0;
-                } else {
-                    mlo = ~0ULL;
-                    mhi = (1ULL << (len - 64)) - 1;
-                }
-                u64 clo, chi;
-                win(cm, clo, chi);
-                clo &= mlo;
-                chi &= mhi;
-                if (__builtin_popcountll(clo) + __builtin_popcountll(chi) != NF - 1) continue;
-                // fields as if unquoted, filled while extracting the commas
-                int k = 0;
-                size_t s = ls;
-                while (clo) {
-                    size_t e = ls + (size_t)__builtin_ctzll(clo);
-                    ends[k] = e;
-                    fp[k] = b + s;
-                    fl[k] = (u32)(e - s);
-                    s = e + 1;
-                    k++;
-                    clo &= clo - 1;
-                }
-                while (chi) {
-                    size_t e = ls + 64 + (size_t)__builtin_ctzll(chi);
-                    ends[k] = e;
-                    fp[k] = b + s;
-                    fl[k] = (u32)(e - s);
-                    s = e + 1;
-                    k++;
-                    chi &= chi - 1;
-                }
-                ends[NF - 1] = ls + len;
-                fp[NF - 1] = b + s;
-                fl[NF - 1] = (u32)(ls + len - s);
-                u64 qlo, qhi;
-                win(q, qlo, qhi);
-                qlo &= mlo;
-                qhi &= mhi;
-                bool bad = false;
-                int f = 0;
-                size_t fstart = ls;
-                while (qlo | qhi) {  // same quote rule as the slow path below
-                    size_t x, y;
-                    if (qlo) {
-                        x = ls + (size_t)__builtin_ctzll(qlo);
-                        qlo &= qlo - 1;
-                    } else {
-                        x = ls + 64 + (size_t)__builtin_ctzll(qhi);
-                        qhi &= qhi - 1;
-                    }
-                    while (ends[f] < x) fstart = ends[f++] + 1;
-                    if (x != fstart) {
-                        bad = true;
-                        break;
-                    }
-                    if (qlo) {
-                        y = ls + (size_t)__builtin_ctzll(qlo);
-                        qlo &= qlo - 1;
-                    } else if (qhi) {
-                        y = ls + 64 + (size_t)__builtin_ctzll(qhi);
-                        qhi &= qhi - 1;
-                    } else {
-                        bad = true;
-                        break;
-                    }
-                    if (y != ends[f] - 1) {
-                        bad = true;
-                        break;
-                    }
-                    fp[f]++;
-                    fl[f] -= 2;
-                }
-                if (!bad) fn(fp, fl);
-                continue;
+                start = line_end + 1;
             }
         }
-        // slow path (lines of 128+ bytes): line end = first newline at >= pos (one exists at N)
-        size_t w = pos >> 6;
-        u64 m = nl[w] & (~0ULL << (pos & 63));
-        while (!m) m = nl[++w];
-        size_t ls = pos, lineEnd = (w << 6) + (size_t)__builtin_ctzll(m);
-        pos = lineEnd + 1;
-        // field count check by popcount (an empty line has one field)
-        if (range_pop(cm, ls, lineEnd) != NF - 1) continue;
-        size_t wa = ls >> 6;
-        u64 mm = cm[wa] & (~0ULL << (ls & 63));
-        for (int k = 0; k < NF - 1; k++) {  // exactly NF-1 commas lie in [ls, lineEnd)
-            while (!mm) mm = cm[++wa];
-            ends[k] = (wa << 6) + (size_t)__builtin_ctzll(mm);
-            mm &= mm - 1;
-        }
-        ends[NF - 1] = lineEnd;
-        // Fields as if unquoted, then walk only this line's quote bits: every quote must be an
-        // opening quote at a field start immediately followed (as the next quote) by a closing
-        // quote at that field's last byte. Anything else makes the line malformed.
-        size_t s = ls;
-        for (int f = 0; f < NF; f++) {
-            fp[f] = b + s;
-            fl[f] = (u32)(ends[f] - s);
-            s = ends[f] + 1;
-        }
-        size_t wq = ls >> 6, wl = lineEnd >> 6;
-        u64 qm = q[wq] & (~0ULL << (ls & 63));
-        int f = 0;
-        size_t fstart = ls;
-        bool bad = false;
-        while (true) {
-            while (!qm && wq < wl) qm = q[++wq];
-            if (!qm) break;
-            size_t x = (wq << 6) + (size_t)__builtin_ctzll(qm);
-            if (x >= lineEnd) break;
-            qm &= qm - 1;
-            while (ends[f] < x) fstart = ends[f++] + 1;  // field containing x (x < lineEnd = ends[NF-1])
-            if (x != fstart) {
-                bad = true;
-                break;
-            }
-            while (!qm && wq < wl) qm = q[++wq];
-            size_t y = qm ? (wq << 6) + (size_t)__builtin_ctzll(qm) : lineEnd;
-            if (y != ends[f] - 1) {  // closing quote must be the field's last byte (y > x, so len >= 2)
-                bad = true;
-                break;
-            }
-            qm &= qm - 1;
-            fp[f]++;
-            fl[f] -= 2;
-        }
-        if (!bad) fn(fp, fl);
+        if (end == lim) break;
+        b = end + 1;
     }
 }
 
@@ -1352,6 +1288,7 @@ static int selftest(i64 WS) {
     for (long it = 0; it < 300000; it++) {
         int NF = (rnd() % 2) ? 7 : 4;
         int nlines = 1 + rnd() % 6;
+        if (it % 1000 == 0) nlines = 700 + rnd() % 400;
         std::string text;
         std::vector<std::string> lines;
         for (int l = 0; l < nlines; l++) {
@@ -1362,6 +1299,7 @@ static int selftest(i64 WS) {
                 std::string v;
                 int len = rnd() % 6;
                 if (rnd() % 25 == 0) len = 40 + rnd() % 140;  // long fields: exercise the 128-byte window edge and slow path
+                if (it % 10000 == 1 && !l && !k) len = CSV_TILE + 64;
                 for (int j = 0; j < len; j++) v += "ab1 \r\""[rnd() % (rnd() % 10 == 0 ? 6 : 4)];
                 if (rnd() % 4 == 0) v = "\"" + v + "\"";
                 if (rnd() % 30 == 0) v = "\"";
