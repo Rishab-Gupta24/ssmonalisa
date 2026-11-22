@@ -896,24 +896,27 @@ static bool load_chunk(const InFile& f, size_t s, size_t e, std::vector<char>& b
 }
 
 // ---------------------------------------------------------------- records
+struct EV {
+    u64 pkey;
+    u32 ts;
+    u32 packed;
+};
+static constexpr u32 TS_DETAIL = TS_INVALID - 1;
 struct ER {  // event row as parsed (for dedup)
     u64 eid;
-    u64 ukey;
-    u32 ts;      // relative to BASE, or TS_INVALID
+    union {
+        u64 ukey;
+        const EV* detail;  // purchases carry their category and price out of line
+    };
+    u32 ts;      // relative to BASE, TS_DETAIL, or TS_INVALID
     i32 ing;     // ingest seconds relative to window start
-    u32 packed;  // purchase: price | cat << 24 ; else 0
-    u32 pad;
 };
+static_assert(sizeof(ER) == 24);
 struct CK {  // valid click, before person resolution
     u64 ukey;
     u64 cid;
     u32 ts;
     u32 camp;
-};
-struct EV {  // surviving event
-    u64 pkey;
-    u32 ts;
-    u32 packed;
 };
 struct CR {  // valid click
     u64 pkey;
@@ -1568,8 +1571,9 @@ int main() {
         const i64 WSs = WS / SEC;
         std::atomic<size_t> nextChunk{0};
         parallel(NT, [&](int t) {
-        // per-partition staging (4 records = 128 B, cache-line aligned), flushed with streaming stores
-        ER* stage = (ER*)ARENA.get((size_t)P * 4 * sizeof(ER));
+        // Eight compact records fill three cache lines.
+        ER* stage = (ER*)ARENA.get((size_t)P * 8 * sizeof(ER));
+        BList<EV> details;  // arena-backed entries remain valid through dedup
         std::vector<u8> scnt(P, 0);
         auto body = [&](size_t ci) {
             static thread_local std::vector<char> buf;
@@ -1603,7 +1607,6 @@ int main() {
                     ER r;
                     bool cn;
                     r.eid = enc_key(fp[0], fl[0], cn);
-                    r.pad = 0;
                     i64 ing = parse_ingest(fp[3], fl[3]);
                     i64 ingS = ing == TS_BAD ? INT32_MAX : ing / SEC - WSs;
                     if (ingS > INT32_MAX) ingS = INT32_MAX;
@@ -1611,7 +1614,6 @@ int main() {
                     r.ing = (i32)ingS;
                     r.ts = TS_INVALID;
                     r.ukey = 0;
-                    r.packed = 0;
                     do {
                         if (!fl[1] || !fl[5]) break;
                         i64 ts = parse_ts_fast(fp[2], fl[2]);
@@ -1651,23 +1653,25 @@ int main() {
                         r.ukey = enc_key(fp[1], fl[1], cn);
                         if (!cn) save(r.ukey, fp[1], fl[1]);
                         r.ts = (u32)(ts - BASE);
-                        r.packed = packed;
+                        if (packed || r.ts >= TS_DETAIL) {
+                            EV* detail = details.take(1, 512);
+                            *detail = {r.ukey, r.ts, packed};
+                            r.detail = detail;
+                            r.ts = TS_DETAIL;
+                        }
                     } while (0);
                     int p = ppart(r.eid);
                     if (!USE_NT) {
                         parts[p].push(r, 256);
                         return;
                     }
-                    ER* sb = stage + (size_t)p * 4;
+                    ER* sb = stage + (size_t)p * 8;
                     sb[scnt[p]] = r;
-                    if (++scnt[p] == 4) {
+                    if (++scnt[p] == 8) {
                         scnt[p] = 0;
-                        __m256i* d = (__m256i*)parts[p].take(4, 256);
+                        __m256i* d = (__m256i*)parts[p].take(8, 256);
                         const __m256i* src = (const __m256i*)sb;
-                        _mm256_stream_si256(d, _mm256_load_si256(src));
-                        _mm256_stream_si256(d + 1, _mm256_load_si256(src + 1));
-                        _mm256_stream_si256(d + 2, _mm256_load_si256(src + 2));
-                        _mm256_stream_si256(d + 3, _mm256_load_si256(src + 3));
+                        for (int j = 0; j < 6; ++j) _mm256_stream_si256(d + j, _mm256_load_si256(src + j));
                     }
                 });
             } else {
@@ -1696,7 +1700,7 @@ int main() {
             if (TIMING) CYCT[t][8 + chunks[ci].kind] += __rdtsc() - c0;
         }
         for (int p = 0; p < P; p++)
-            for (int j = 0; j < scnt[p]; j++) evParts[t][p].push(stage[(size_t)p * 4 + j], 256);
+            for (int j = 0; j < scnt[p]; j++) evParts[t][p].push(stage[(size_t)p * 8 + j], 256);
         _mm_sfence();
         });
         for (auto& r : regs) {
@@ -1863,7 +1867,8 @@ int main() {
         };
         auto task_fn = [&](size_t task) {
             static thread_local HMap m;
-            static thread_local std::vector<const ER*> buf, surv;
+            static thread_local std::vector<const ER*> buf;
+            static thread_local std::vector<EV> surv;
             u64 d0 = TIMING ? __rdtsc() : 0;
             if (task < (size_t)P) {
                 int p = (int)task;
@@ -1890,13 +1895,14 @@ int main() {
                 u64 d1 = TIMING ? __rdtsc() : 0;
                 surv.clear();
                 for (const ER* r : buf)
-                    if (r->ts != TS_INVALID) surv.push_back(r);
+                    if (r->ts != TS_INVALID)
+                        surv.push_back(r->ts == TS_DETAIL ? *r->detail : EV{r->ukey, r->ts, 0});
                 size_t ns = surv.size();
                 for (size_t i = 0; i < ns; i++) {
-                    if (i + PD < ns) LT.prefetch(surv[i + PD]->ukey);
-                    const ER& r = *surv[i];
-                    const Slot* sl = LT.find(r.ukey);
-                    u64 pk = sl ? sl->v : r.ukey;
+                    if (i + PD < ns) LT.prefetch(surv[i + PD].pkey);
+                    const EV& r = surv[i];
+                    const Slot* sl = LT.find(r.pkey);
+                    u64 pk = sl ? sl->v : r.pkey;
                     emit(pshard(pk), EV{pk, r.ts, r.packed});
                 }
                 if (TIMING) CYCT[t][10] += d1 - d0, CYCT[t][11] += __rdtsc() - d1;
